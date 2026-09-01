@@ -88,6 +88,29 @@ filter_index_keywords <- function(x) {
     paste(terms[!normalized %in% excluded], collapse = "; ")
   }, character(1))
 }
+extract_affiliation_regions <- function(x) {
+  us <- c("Alabama","Alaska","Arizona","Arkansas","California","Colorado","Connecticut","Delaware","Florida","Georgia","Hawaii","Idaho","Illinois","Indiana","Iowa","Kansas","Kentucky","Louisiana","Maine","Maryland","Massachusetts","Michigan","Minnesota","Mississippi","Missouri","Montana","Nebraska","Nevada","New Hampshire","New Jersey","New Mexico","New York","North Carolina","North Dakota","Ohio","Oklahoma","Oregon","Pennsylvania","Rhode Island","South Carolina","South Dakota","Tennessee","Texas","Utah","Vermont","Virginia","Washington","West Virginia","Wisconsin","Wyoming","District of Columbia")
+  cn <- c("Beijing","Tianjin","Shanghai","Chongqing","Hebei","Shanxi","Liaoning","Jilin","Heilongjiang","Jiangsu","Zhejiang","Anhui","Fujian","Jiangxi","Shandong","Henan","Hubei","Hunan","Guangdong","Hainan","Sichuan","Guizhou","Yunnan","Shaanxi","Gansu","Qinghai","Taiwan","Inner Mongolia","Guangxi","Tibet","Ningxia","Xinjiang","Hong Kong","Macao","Macau")
+  vapply(x, function(value) {
+    text <- paste(as.character(value %||% ""), collapse = "; "); out <- character()
+    hit_regions <- function(pool) pool[vapply(pool, function(region) grepl(paste0("\\b", gsub(" ", "\\\\s+", region), "\\b"), text, ignore.case = TRUE, perl = TRUE), logical(1))]
+    if (grepl("United States|USA|U\\.S\\.A\\.", text, ignore.case = TRUE, perl = TRUE)) { hit <- hit_regions(us); if (length(hit)) out <- c(out, paste0("United States: ", hit)) }
+    if (grepl("China|Hong Kong|Macao|Macau|Taiwan", text, ignore.case = TRUE, perl = TRUE)) { hit <- hit_regions(cn); hit[hit == "Macau"] <- "Macao"; if (length(hit)) out <- c(out, paste0("China: ", hit)) }
+    paste(unique(out), collapse = "; ")
+  }, character(1))
+}
+
+china_region_coordinates <- tibble(Region=c("Beijing","Tianjin","Shanghai","Chongqing","Hebei","Shanxi","Liaoning","Jilin","Heilongjiang","Jiangsu","Zhejiang","Anhui","Fujian","Jiangxi","Shandong","Henan","Hubei","Hunan","Guangdong","Hainan","Sichuan","Guizhou","Yunnan","Shaanxi","Gansu","Qinghai","Taiwan","Inner Mongolia","Guangxi","Tibet","Ningxia","Xinjiang","Hong Kong","Macao"), lon=c(116.4,117.2,121.5,106.6,114.5,112.6,123.4,125.3,127.5,118.8,120.2,117.3,119.3,115.9,117.0,113.6,114.3,112.9,113.3,110.3,104.1,106.7,102.7,108.9,103.8,101.8,121.0,111.7,108.3,91.1,106.2,87.6,114.2,113.5), lat=c(39.9,39.1,31.2,29.6,38.0,37.9,41.8,43.9,47.1,32.1,30.3,31.9,26.1,28.7,36.7,34.7,30.6,28.2,23.1,20.0,30.7,26.6,25.0,34.3,36.1,36.6,23.7,40.8,22.8,29.6,38.5,43.8,22.3,22.2))
+# Names required by hchinamap for the optional province-level choropleth.
+china_hchinamap_names <- c(
+  Beijing="北京", Tianjin="天津", Shanghai="上海", Chongqing="重庆", Hebei="河北", Shanxi="山西",
+  Liaoning="辽宁", Jilin="吉林", Heilongjiang="黑龙江", Jiangsu="江苏", Zhejiang="浙江", Anhui="安徽",
+  Fujian="福建", Jiangxi="江西", Shandong="山东", Henan="河南", Hubei="湖北", Hunan="湖南",
+  Guangdong="广东", Hainan="海南", Sichuan="四川", Guizhou="贵州", Yunnan="云南", Shaanxi="陕西",
+  Gansu="甘肃", Qinghai="青海", Taiwan="台湾", `Inner Mongolia`="内蒙古", Guangxi="广西", Tibet="西藏",
+  Ningxia="宁夏", Xinjiang="新疆", `Hong Kong`="香港", Macao="澳门"
+)
+
 derive_affiliation_fields <- function(df) {
   if (!"Affiliations" %in% names(df)) return(df)
   split_affiliations <- function(x) trimws(unlist(strsplit(ifelse(is.na(x), "", x), ";", fixed = TRUE)))
@@ -111,6 +134,7 @@ derive_affiliation_fields <- function(df) {
     paste(unique(hits), collapse = "; ")
   })
   df$Countries_From_Affiliations <- unlist(countries_from_affiliations)
+  df$Regions_From_Affiliations <- extract_affiliation_regions(df$Affiliations)
   df$Institutes_From_Affiliations <- unlist(institutes)
   df$Departments_From_Affiliations <- unlist(departments)
   # Keep the general fields complete while retaining the publisher-raw affiliation extractions.
@@ -215,12 +239,30 @@ canonical_corresponding_author <- function(corresponding_author, full_names) {
 }
 
 role_affiliation_fields <- function(affiliations, prefix) {
-  role_df <- tibble(Affiliations = affiliations, Countries = "", Departments = "", Institutes = "")
+  role_df <- tibble(Affiliations = affiliations, Countries = "", Departments = "", Institutes = "", Regions = "")
   role_df <- derive_affiliation_fields(role_df)
-  names(role_df)[match(c("Countries_From_Affiliations", "Institutes_From_Affiliations", "Departments_From_Affiliations"), names(role_df))] <-
-    paste0(prefix, c("_Countries", "_Institutes", "_Departments"))
-  role_df[, paste0(prefix, c("_Countries", "_Institutes", "_Departments")), drop = FALSE]
+  names(role_df)[match(c("Countries_From_Affiliations", "Institutes_From_Affiliations", "Departments_From_Affiliations", "Regions_From_Affiliations"), names(role_df))] <-
+    paste0(prefix, c("_Countries", "_Institutes", "_Departments", "_Regions"))
+  role_df[, paste0(prefix, c("_Countries", "_Institutes", "_Departments", "_Regions")), drop = FALSE]
 }
+fill_paired_regions <- function(first_regions, corresponding_regions) {
+  clean <- function(value) {
+    values <- unique_terms(value)
+    # Do not create country-only labels such as "China:" or "United States:".
+    values <- values[grepl("^(China|United States):\\s*\\S", values, perl = TRUE)]
+    paste(unique(values), collapse = "; ")
+  }
+  fa <- vapply(first_regions, clean, character(1))
+  ca <- vapply(corresponding_regions, clean, character(1))
+  fa_missing <- !nzchar(fa)
+  ca_missing <- !nzchar(ca)
+  fa[fa_missing] <- ca[fa_missing]
+  ca[ca_missing] <- fa[ca_missing]
+  list(FA_Region = fa, CA_Region = ca)
+}
+region_visual_label <- function(x) sub("^(China|United States):\\s*", "", as.character(x), perl = TRUE)
+region_visual_colour <- function(x) ifelse(grepl("^China:", as.character(x)), "#d62728", ifelse(grepl("^United States:", as.character(x)), "#1f77b4", "black"))
+
 add_author_role_fields <- function(df) {
   pick <- function(candidates) {
     hit <- intersect(candidates, names(df))
@@ -241,11 +283,18 @@ add_author_role_fields <- function(df) {
   df$FA_Author <- df$First_Author
   df$FA_Author_ID <- df$First_Author_ID
   df$FA_Country <- first_fields$First_Author_Countries
+  df$FA_Region <- first_fields$First_Author_Regions
   df$FA_Institute <- first_fields$First_Author_Institutes
   df$FA_Department <- first_fields$First_Author_Departments
   df$CA_Author <- df$Corresponding_Author
   df$CA_Author_ID <- df$Corresponding_Author_ID
   df$CA_Country <- corresponding_fields$Corresponding_Author_Countries
+  df$CA_Region <- corresponding_fields$Corresponding_Author_Regions
+  paired_regions <- fill_paired_regions(df$FA_Region, df$CA_Region)
+  df$FA_Region <- paired_regions$FA_Region
+  df$CA_Region <- paired_regions$CA_Region
+  first_fields$First_Author_Regions <- df$FA_Region
+  corresponding_fields$Corresponding_Author_Regions <- df$CA_Region
   df$CA_Institute <- corresponding_fields$Corresponding_Author_Institutes
   df$CA_Department <- corresponding_fields$Corresponding_Author_Departments
   cbind(df, first_fields, corresponding_fields)
@@ -586,15 +635,17 @@ cooccurrence <- function(term_sets, top_n = 20) {
 }
 
 frequency_entity_tab <- function(id, title) tabPanel(title,
-  tabsetPanel(
+  tags$h4("Visualisations"),
+  tabsetPanel(id = paste0("visual_tabs_", id),
     tabPanel("Top-20 node counts", tableOutput(paste0(id, "_nodes"))),
     tabPanel("Slope plot", plotOutput(paste0(id, "_slope"), height = "900px"))
   )
 )
-flca_entity_tab <- function(id, title) tabPanel(title,
-  tabsetPanel(
+flca_entity_tab <- function(id, title, extra_visual_tabs = list()) tabPanel(title,
+  tags$h4("Visualisations"),
+  do.call(tabsetPanel, c(list(id = paste0("visual_tabs_", id),
     tabPanel("Top-20 node counts", tableOutput(paste0(id, "_nodes"))),
-        tabPanel("Full network", plotOutput(paste0(id, "_full"), height = "650px")),
+    tabPanel("Full network", plotOutput(paste0(id, "_full"), height = "650px")),
     tabPanel("Reduced network", plotOutput(paste0(id, "_reduced"), height = "650px")),
     tabPanel("Sankey plot", plotOutput(paste0(id, "_sankey"), height = "650px")),
     tabPanel("Chord plot", plotOutput(paste0(id, "_chord"), height = "650px")),
@@ -602,7 +653,7 @@ flca_entity_tab <- function(id, title) tabPanel(title,
     tabPanel("Kano plot", plotOutput(paste0(id, "_kano"), height = "900px")),
     tabPanel("Slope plot", plotOutput(paste0(id, "_slope"), height = "900px")),
     tabPanel("Top-20 cluster table", tableOutput(paste0(id, "_clusters")), tableOutput(paste0(id, "_edges")))
-  )
+  ), extra_visual_tabs))
 )
 
 summary_h <- function(x) { x <- sort(as.numeric(x[is.finite(x)]), decreasing=TRUE); if(!length(x)) return(0L); sum(x >= seq_along(x)) }
@@ -655,8 +706,67 @@ draw_summary_report <- function(summary_df, n_articles = NA_integer_, dataset_h 
   mtext(title,outer=TRUE,font=2,cex=2.85,line=1)
 }
 
+# Demo 2: generic group-comparison Rating Scale Model (RSM).
+# CSV convention: first column = ID, final column = group; numeric middle columns = items.
+read_demo2_csv <- function(path) {
+  x <- tryCatch(utils::read.csv(path, stringsAsFactors = FALSE, check.names = FALSE, na.strings = c("", "."), fileEncoding = "UTF-8-BOM"), error = function(e) NULL)
+  validate(need(!is.null(x) && nrow(x) >= 3 && ncol(x) >= 4, "Demo 2 CSV needs an ID column, at least two numeric items, a group column, and three records."))
+  for (j in 2:(ncol(x) - 1)) if (is.character(x[[j]])) {
+    value <- suppressWarnings(as.numeric(gsub(",", "", trimws(x[[j]]), fixed = TRUE)))
+    present <- !is.na(x[[j]]) & nzchar(trimws(x[[j]]))
+    if (!any(present) || all(is.finite(value[present]))) x[[j]] <- value
+  }
+  x
+}
+fit_demo2_rsm <- function(raw, categories = 4L, iterations = 60L) {
+  categories <- suppressWarnings(as.integer(categories[1]))
+  if (!is.finite(categories) || categories < 2L) categories <- 4L
+  iterations <- suppressWarnings(as.integer(iterations[1]))
+  if (!is.finite(iterations) || iterations < 1L) iterations <- 60L
+  item_names <- names(raw)[vapply(raw, is.numeric, logical(1))]
+  item_names <- setdiff(item_names, c(names(raw)[1], names(raw)[ncol(raw)]))
+  validate(need(length(item_names) >= 2, "Demo 2 requires at least two numeric item columns between the ID and group columns."))
+  x <- as.matrix(raw[item_names]); storage.mode(x) <- "numeric"; observed <- is.finite(x)
+  validate(need(all(colSums(observed) >= 2), "Every RSM item needs at least two numeric responses."))
+  z <- as.matrix(scale(x)); lower <- apply(z, 2, min, na.rm = TRUE); upper <- apply(z, 2, max, na.rm = TRUE); span <- upper - lower
+  validate(need(all(is.finite(span) & span > 0), "Every RSM item must vary before Z-standardization and 0–4 categorization."))
+  score <- sweep(sweep(z, 2, lower, "-"), 2, span, "/") * categories
+  y <- round(score); y[!observed] <- NA_real_; y[y < 0] <- 0; y[y > categories] <- categories
+  np <- as.integer(nrow(y)); ni <- as.integer(ncol(y)); n_steps <- as.integer(categories + 1L); validate(need(is.finite(np) && np > 1L && is.finite(ni) && ni > 1L && is.finite(n_steps) && n_steps > 1L, "Invalid Demo 2 RSM dimensions.")); cats <- seq.int(0L, categories); theta <- rep.int(0, np); beta <- rep.int(0, ni); step <- rep.int(0, n_steps)
+  expected <- variance <- matrix(NA_real_, np, ni)
+  for (iteration in seq_len(iterations)) {
+    person_score <- person_info <- rep(0, np); item_score <- item_info <- rep(0, ni); step_score <- step_info <- rep(0, categories + 1L); cumulative_step <- cumsum(step)
+    for (person in seq_len(np)) for (item in seq_len(ni)) if (observed[person, item]) {
+      logits <- cats * (theta[person] - beta[item]) - cumulative_step; probability <- exp(logits - max(logits)); probability <- probability / sum(probability)
+      expectation <- sum(cats * probability); info <- max(sum((cats - expectation)^2 * probability), 1e-5); residual <- y[person, item] - expectation
+      expected[person, item] <- expectation; variance[person, item] <- info
+      person_score[person] <- person_score[person] + residual; person_info[person] <- person_info[person] + info
+      item_score[item] <- item_score[item] + residual; item_info[item] <- item_info[item] + info
+      step_score <- step_score + (as.integer(y[person, item]) == cats) - probability; step_info <- step_info + pmax(probability * (1 - probability), 1e-5)
+    }
+    theta <- pmax(-8, pmin(8, theta + person_score / pmax(person_info, .001)))
+    beta <- pmax(-8, pmin(8, beta - item_score / pmax(item_info, .001))); beta <- beta - mean(beta)
+    if (categories > 1) { step[-1] <- pmax(-5, pmin(5, step[-1] - .10 * step_score[-1] / step_info[-1])); step <- step - mean(step) }
+  }
+  residual <- y - expected; z_residual <- residual / sqrt(pmax(variance, 1e-5)); person_info <- rowSums(variance, na.rm = TRUE)
+  person <- tibble(Person = as.character(raw[[1]]), Group = as.character(raw[[ncol(raw)]]), Measure = theta, SE = 1 / sqrt(pmax(person_info, .001)), N_items = rowSums(observed), Infit_MNSQ = rowSums(z_residual^2 * variance, na.rm = TRUE) / pmax(person_info, .001), Outfit_MNSQ = rowMeans(z_residual^2, na.rm = TRUE))
+  list(raw = raw, standardized = z, category_score = y, person = person, items = tibble(Item = item_names, Difficulty = beta, SE = 1 / sqrt(pmax(colSums(variance, na.rm = TRUE), .001))), model = "Rating Scale Model: each numeric item is Z-standardized separately, then linearly categorized to 0–4 before RSM estimation.")
+}
+demo2_group_summary <- function(fit) {
+  country_labels <- c(usa = "United States (usa)", chn = "China (chn)", twn = "Taiwan (twn)", hkg = "Hong Kong (hkg)", gbr = "United Kingdom (gbr)", kor = "South Korea (kor)", jpn = "Japan (jpn)", can = "Canada (can)", aus = "Australia (aus)")
+  d <- fit$person |> mutate(Group = ifelse(is.na(Group) | !nzchar(trimws(Group)), "Missing group", trimws(as.character(Group))))
+  d |> group_by(Group) |> summarise(N = n(), Measure = mean(Measure, na.rm = TRUE), SD = stats::sd(Measure, na.rm = TRUE), SE = ifelse(is.finite(SD), SD / sqrt(N), mean(SE, na.rm = TRUE)), .groups = "drop") |> mutate(Display_group = dplyr::recode(tolower(Group), !!!country_labels, .default = Group), Label = paste0(Display_group, " (n=", N, ")"))
+}
+draw_demo2_group_forest <- function(fit, kid = 1L) {
+  d <- demo2_group_summary(fit); persons <- fit$person; kid <- max(1L, min(nrow(persons), suppressWarnings(as.integer(kid[1])))); chosen <- persons[kid, , drop = FALSE]
+  d <- bind_rows(d |> mutate(Selected = FALSE), tibble(Group = as.character(chosen$Group), N = 1L, Measure = chosen$Measure, SD = NA_real_, SE = chosen$SE, Label = paste0("KID#", kid, ": ", chosen$Person, " [", chosen$Group, "]"), Selected = TRUE))
+  d$SE[!is.finite(d$SE)] <- 0; d <- d |> arrange(Selected, Measure); d$Lower <- d$Measure - d$SE; d$Upper <- d$Measure + d$SE
+  y <- rev(seq_len(nrow(d))); limits <- range(c(d$Lower, d$Upper, 0), na.rm = TRUE); padding <- max(.25, diff(limits) * .12); limits <- limits + c(-padding, padding)
+  par(mar = c(4.5, 16, 4.5, 6), xpd = NA); plot(NA, xlim = limits, ylim = c(.5, nrow(d) + .5), yaxt = "n", xlab = "Rasch Rating Scale Model measure (logits; bars = ±1 SE)", ylab = "", main = paste0("Profile-group comparison with KID#", kid))
+  abline(v = 0, lty = 2, col = "grey55"); axis(2, y, labels = FALSE); text(limits[1], y, labels = d$Label, pos = 2, offset = .55, cex = .80, font = ifelse(tolower(d$Group) == "usa", 2, 1), col = ifelse(tolower(d$Group) == "usa", "#143E7A", "black")); segments(d$Lower, y, d$Upper, y, lwd = 2, col = ifelse(tolower(d$Group) == "usa", "#143E7A", "#6B7280")); points(d$Measure, y, pch = ifelse(d$Selected, 18, 19), cex = ifelse(d$Selected, 1.5, 1.15), col = ifelse(d$Selected, "#D94801", ifelse(tolower(d$Group) == "usa", "#143E7A", "#149B52"))); text(limits[2], y, sprintf("%.2f [%.2f, %.2f]", d$Measure, d$Lower, d$Upper), pos = 2, offset = .45, cex = .8)
+}
 ui <- fluidPage(
-  titlePanel("Journal Metadata & FLCA Explorer for Scopus metadata"),
+  titlePanel("Scopus Metadata via FLCAr based on FA/CA authors"),
   tags$head(tags$style(HTML(".flca-entity-heading { font-weight: 700; color: #1f4e79; margin-top: 14px; } .tab-content { overflow-x: auto; } .nav-tabs > li.active > a, .nav-tabs > li.active > a:hover, .nav-tabs > li.active > a:focus, .nav-pills > li.active > a, .nav-pills > li.active > a:hover, .nav-pills > li.active > a:focus { color: #fff !important; background-color: #c9302c !important; border-color: #a52824 !important; font-weight: 700; }"))),
   sidebarLayout(
     sidebarPanel(width = 3,
@@ -681,7 +791,14 @@ ui <- fluidPage(
       tags$hr(), tags$h4("F. Graphical abstract"),
       textAreaInput("article_content", "Article content (authors are ignored)", value = default_article_content, rows = 9),
       fluidRow(column(7, actionButton("extract_article_content", "Extract keywords", class = "btn-success btn-block")), column(5, actionButton("clear_article_content", "Clear content", class = "btn-default btn-block"))),
-      sliderInput("graphical_phrase_min", "Minimum keyphrase occurrences", min = 1, max = 10, value = 2, step = 1)
+      sliderInput("graphical_phrase_min", "Minimum keyphrase occurrences", min = 1, max = 10, value = 2, step = 1),
+      tags$hr(), tags$h4("Demo 2: Rasch group forest"),
+      helpText("Top-2% scientists: first column = name, the 11 numeric middle columns = items, and final profile column = group. Each item is Z-standardized then categorized 0–4."),
+      downloadButton("download_demo2", "Download data2.csv", class = "btn-default btn-block"),
+      actionButton("run_demo2", "Run Demo 2 RSM forest", class = "btn-success btn-block"),
+      numericInput("demo2_kid", "Selected KID# for forest comparison", value = 1, min = 1, step = 1),
+      fileInput("demo2_csv", "Or upload a group-comparison CSV", accept = c("text/csv", ".csv"), buttonLabel = "Browse..."),
+      actionButton("run_demo2_upload", "Run uploaded RSM forest", class = "btn-primary btn-block")
     ),
     mainPanel(width = 9,
       tabsetPanel(id = "main_tabs",
@@ -699,8 +816,13 @@ ui <- fluidPage(
           textOutput("flca_status"), br(),
           tabsetPanel(id = "entity_tabs",
             flca_entity_tab("authors", "FA/CA authors"),
-            flca_entity_tab("countries", "FA/CA countries"),
-            tabPanel("FA/CA country map", plotOutput("country_choropleth", height = "800px"), tableOutput("country_choropleth_counts")),
+            flca_entity_tab("countries", "FA/CA countries", list(
+              tabPanel("World choropleth map", h4("FA/CA countries worldwide"), plotOutput("country_choropleth", height = "800px"), tableOutput("country_choropleth_counts"))
+            )),
+            flca_entity_tab("regions", "FA/CA regions", list(
+              tabPanel("World choropleth map", h4("FA/CA countries worldwide"), plotOutput("region_world_choropleth", height = "800px"), tableOutput("region_world_choropleth_counts")),
+              tabPanel("China / US choropleths", fluidRow(column(6, h4("United States states"), plotOutput("us_region_map", height = "520px")), column(6, h4("China provinces, Hong Kong, and Taiwan"), uiOutput("china_region_map", height = "520px"))), tableOutput("region_counts"))
+            )),
             flca_entity_tab("institutes", "FA/CA institutes"),
             flca_entity_tab("departments", "FA/CA departments"),
             flca_entity_tab("keywords", "Author Keywords"),
@@ -731,12 +853,20 @@ ui <- fluidPage(
           plotOutput("summary_report", height = "3000px"), br(),
           tableOutput("summary_table")
         ),
+        tabPanel("Demo 2: Rasch forest",
+          h3("Group-comparison Rasch Rating Scale Model forest plot"),
+          p("For the top-2% scientist Demo 2, the 11 numeric indicators are Z-standardized separately and converted to 0–4 categories before RSM estimation. The final profile column defines comparison groups."),
+          textOutput("demo2_status"), br(),
+          plotOutput("demo2_group_forest", width = "100%", height = "1300px"),
+          h4("Group estimates"), tableOutput("demo2_group_table"),
+          h4("RSM item estimates"), tableOutput("demo2_item_table")
+        ),
         tabPanel("ReadMe",
           h3("Scopus FLCA workflow"),
           tags$ol(
             tags$li("Choose Run supplied Scopus demo, or upload a Scopus CSV."),
-            tags$li("For an upload, click Normalize selected CSV. This creates FA_* and CA_* author, country, institute, and department fields."),
-            tags$li("Click Build co-occurrence, then inspect the FA/CA authors, countries, institutes, departments, Author Keywords, and Index Keywords tabs."),
+            tags$li("An upload automatically creates FA_* and CA_* author, country, institute, and department fields, then builds the cached FLCA results."),
+            tags$li("Inspect the FA/CA authors, countries, institutes, departments, Author Keywords, and Index Keywords tabs. Use Build co-occurrence to recalculate the current dataset."),
             tags$li("Index Keywords exclude generic human, demographic, and publication-indexing labels before FLCA.")
           ),
           h4("Interpretation of FLCA outputs"),
@@ -764,7 +894,31 @@ server <- function(input, output, session) {
   article_references <- reactiveVal(parse_mdpi_references(default_scopus_references))
   graphical_abstract <- reactiveVal(extract_article_content_terms(default_article_content))
   selected_scopus_csv <- reactiveVal(NULL)
+  demo2_path <- reactiveVal(NULL)
+  demo2_fit <- reactiveVal(NULL)
+  demo2_status_value <- reactiveVal("Choose Run Demo 2 or select an upload, then click Run uploaded RSM forest.")
   observeEvent(data(), { flca_cache(list()) }, ignoreInit = TRUE)
+  output$download_demo2 <- downloadHandler(filename = function() "data2.csv", content = function(file) file.copy("data2.csv", file, overwrite = TRUE))
+  run_demo2_analysis <- function(path) {
+    demo2_status_value("Running: 1) Z-standardizing each item; 2) categorizing to 0–4; 3) fitting the Rating Scale Model by profile group.")
+    result <- tryCatch(withProgress(message = "Running Demo 2 Rating Scale Model", value = 0, {
+      incProgress(.15, detail = "Reading dot/blank values as missing")
+      raw <- read_demo2_csv(path)
+      incProgress(.45, detail = "Z-standardizing and categorizing 11 items")
+      fit <- fit_demo2_rsm(raw)
+      incProgress(.95, detail = "Building group forest with selected KID")
+      fit
+    }), error = function(e) e)
+    if (inherits(result, "error")) { demo2_fit(NULL); demo2_status_value(paste("Demo 2 could not run:", conditionMessage(result))); updateTabsetPanel(session, "main_tabs", selected = "Demo 2: Rasch forest"); return() }
+    demo2_fit(result); demo2_status_value(paste0("Completed: ", nrow(result$person), " scientists, ", nrow(result$items), " standardized 0–4 items, ", nrow(demo2_group_summary(result)), " profile groups; forest includes KID#", input$demo2_kid, ".")); updateTabsetPanel(session, "main_tabs", selected = "Demo 2: Rasch forest")
+  }
+  observeEvent(input$run_demo2, { demo2_path("data2.csv"); run_demo2_analysis("data2.csv") })
+  observeEvent(input$demo2_csv, { req(input$demo2_csv$datapath); demo2_path(input$demo2_csv$datapath); demo2_status_value(paste("Uploaded", input$demo2_csv$name, "— click Run uploaded RSM forest.")) })
+  observeEvent(input$run_demo2_upload, { if (is.null(demo2_path())) { demo2_status_value("Choose a CSV first."); updateTabsetPanel(session, "main_tabs", selected = "Demo 2: Rasch forest") } else run_demo2_analysis(demo2_path()) })
+  output$demo2_status <- renderText(demo2_status_value())
+  output$demo2_group_forest <- renderPlot({ req(demo2_fit()); draw_demo2_group_forest(demo2_fit(), input$demo2_kid) })
+  output$demo2_group_table <- renderTable({ req(demo2_fit()); demo2_group_summary(demo2_fit()) |> arrange(desc(Measure)) }, digits = 3, striped = TRUE, bordered = TRUE)
+  output$demo2_item_table <- renderTable({ req(demo2_fit()); demo2_fit()$items }, digits = 3, striped = TRUE, bordered = TRUE)
   observeEvent(session$clientData$url_search, {
     query <- parseQueryString(session$clientData$url_search)
     supplied_issn <- query$ISSN %||% query$issn
@@ -895,6 +1049,7 @@ observeEvent(input$extract_article_content, {
       countries = list(label = "FA/CA countries", network = country_net),
       institutes = list(label = "FA/CA institutes", network = institute_net),
       departments = list(label = "FA/CA departments", network = department_net),
+      regions = list(label = "FA/CA regions", network = region_net),
       keywords = list(label = "Author keywords", network = keyword_net),
       index_keywords = list(label = "Index keywords", network = index_keyword_net)
     )
@@ -959,10 +1114,12 @@ observeEvent(input$extract_article_content, {
     })
     cooccurrence(sets, min(20, input$top_n))
   }
-  draw_network <- function(net, label) {
+  draw_network <- function(net, label, region_style = FALSE) {
     if (!nrow(net$nodes)) { plot.new(); text(.5, .5, paste("No", label, "terms are available.")); return() }
     n <- nrow(net$nodes); theta <- seq(0, 2 * pi, length.out = n + 1)[-(n + 1)]
     coords <- data.frame(term = net$nodes$term, x = cos(theta), y = sin(theta), frequency = net$nodes$frequency)
+    coords$display <- if (region_style) region_visual_label(coords$term) else coords$term
+    coords$text_col <- if (region_style) region_visual_colour(coords$term) else "black"
     plot(coords$x, coords$y, type = "n", xlim = c(-1.35, 1.35), ylim = c(-1.35, 1.35), axes = FALSE, xlab = "", ylab = "", main = paste(label, "co-occurrence — Top", n), cex.main = 1.3, font.main = 2, cex.main = 1.35)
     if (nrow(net$edges)) for (i in seq_len(nrow(net$edges))) {
       a <- coords[match(net$edges$from[i], coords$term), ]; b <- coords[match(net$edges$to[i], coords$term), ]
@@ -970,7 +1127,7 @@ observeEvent(input$extract_article_content, {
     }
     palette <- grDevices::hcl.colors(max(n, 3), "Set 2")
     points(coords$x, coords$y, pch = 21, bg = palette[seq_len(n)], col = "grey15", cex = 1.3 + 2.4 * (coords$frequency / max(coords$frequency)))
-    text(coords$x, coords$y, labels = coords$term, cex = 1.05, font = 2)
+    text(coords$x, coords$y, labels = coords$display, cex = 1.05, font = 2, col = coords$text_col)
   }
   author_net <- reactive(entity_pair_network(c("FA_Author", "CA_Author")))
   first_author_net <- reactive(role_affiliation_network("FA_Author", c(Country = "FA_Country", Institute = "FA_Institute", Department = "FA_Department")))
@@ -986,6 +1143,7 @@ observeEvent(input$extract_article_content, {
   country_net <- reactive(entity_pair_network(c("FA_Country", "CA_Country")))
   institute_net <- reactive(entity_pair_network(c("FA_Institute", "CA_Institute")))
   department_net <- reactive(entity_pair_network(c("FA_Department", "CA_Department")))
+  region_net <- reactive(entity_pair_network(c("FA_Region", "CA_Region")))
   fa_ca_country_counts <- reactive({
     x <- data(); if (!nrow(x)) return(tibble(Country = character(), Count = integer(), map_region = character()))
     columns <- intersect(c("FA_Country", "CA_Country"), names(x))
@@ -1006,8 +1164,80 @@ observeEvent(input$extract_article_content, {
   })
   reference_author_journal_net <- reactive({ x <- article_references(); if (!nrow(x)) return(list(nodes=tibble(), edges=tibble())); x$Author_Journal <- vapply(seq_len(nrow(x)), function(i) paste(c(unique_terms(x$Authors[i]), if (!empty_text(x$Journal[i])) paste0("Journal: ", x$Journal[i]) else character()), collapse="; "), character(1)); cooccurrence(article_term_sets(x, "Author_Journal"), min(20, input$top_n)) })
   graphical_abstract_net <- reactive({ z <- graphical_abstract(); blocked <- z$abbreviations %||% character(); final_sets <- lapply(z$sets, function(s) setdiff(s, blocked)); cooccurrence(final_sets, 20L) })
+  fa_ca_region_counts <- reactive({
+    x <- data(); columns <- intersect(c("FA_Region", "CA_Region"), names(x))
+    if (!nrow(x) || !length(columns)) return(tibble(Country = character(), Region = character(), Count = integer()))
+    rows <- bind_rows(lapply(seq_len(nrow(x)), function(i) {
+      values <- unique(unlist(lapply(columns, function(column) unique_terms(x[[column]][i])), use.names = FALSE))
+      if (!length(values)) return(NULL)
+      tibble(article = i, Label = values)
+    }))
+    if (!nrow(rows)) return(tibble(Country = character(), Region = character(), Count = integer()))
+    rows |> distinct(article, Label) |> mutate(Country = sub(":.*$", "", Label), Region = trimws(sub("^[^:]+:", "", Label))) |> count(Country, Region, name = "Count", sort = TRUE)
+  })
+  output$region_counts <- renderTable({ fa_ca_region_counts() }, striped = TRUE, bordered = TRUE)
+  output$us_region_map <- renderPlot({
+    counts <- filter(fa_ca_region_counts(), Country == "United States")
+    if (!nrow(counts)) return(draw_message("No United States state affiliations are available."))
+    if (!requireNamespace("maps", quietly = TRUE)) return(draw_message("Install the maps package to render the United States state map."))
+    states <- ggplot2::map_data("state") |> left_join(mutate(counts, region = tolower(Region)), by = "region")
+    contiguous <- filter(states, !region %in% c("alaska", "hawaii")) |> mutate(group = as.character(group))
+    # `map_data("state")` omits AK/HI in some maps installations.  Obtain
+    # their outlines from the world database, then join the same FA/CA counts.
+    world_insets <- ggplot2::map_data("world") |> mutate(region_key = tolower(coalesce(subregion, ""))) |> filter(region_key %in% c("alaska", "hawaii")) |> transmute(long, lat, group = paste0("inset_", group), region = region_key) |> left_join(mutate(counts, region = tolower(Region)), by = "region")
+    if (!nrow(world_insets)) world_insets <- filter(states, region %in% c("alaska", "hawaii")) |> mutate(group = paste0("inset_", group))
+    alaska <- filter(world_insets, region == "alaska") |> mutate(long = (long + 180) * .35 - 125, lat = (lat - 51) * .35 + 24)
+    hawaii <- filter(world_insets, region == "hawaii") |> mutate(long = (long + 161) * 1.4 - 104, lat = (lat - 18) * 1.4 + 24)
+    display_states <- bind_rows(contiguous, alaska, hawaii)
+    ggplot(display_states, aes(long, lat, group = group, fill = Count)) + geom_polygon(colour = "white", linewidth = .2) + coord_quickmap(xlim = c(-126, -65), ylim = c(23, 51), expand = FALSE) + scale_fill_gradient(low = "#dbeafe", high = "#08306b", na.value = "grey92", name = "Articles\n(n)") + labs(title = "FA/CA United States states", subtitle = "Alaska and Hawaii are shown as insets") + theme_void(base_size = 12) + theme(plot.title = element_text(hjust = .5, face = "bold"), plot.subtitle = element_text(hjust = .5))
+  })
+  output$china_region_map <- renderUI({
+    counts <- filter(fa_ca_region_counts(), Country == "China")
+    if (!nrow(counts)) return(tags$div(class = "alert alert-info", "No China provincial, Hong Kong, or Taiwan affiliations are available."))
+    if (!requireNamespace("hchinamap", quietly = TRUE)) return(plotOutput("china_region_map_fallback", height = "520px"))
+    mapped <- tibble(name = unname(china_hchinamap_names[counts$Region]), value = counts$Count) |> filter(!is.na(name))
+    if (!nrow(mapped)) return(tags$div(class = "alert alert-info", "No recognized China province, Hong Kong, or Taiwan values are available."))
+    hchinamap::hchinamap(name = mapped$name, value = mapped$value, region = "China", width = "100%", height = "520px", title = "FA/CA China regions — article count")
+  })
+  output$china_region_map_fallback <- renderPlot({
+    counts <- filter(fa_ca_region_counts(), Country == "China")
+    if (!nrow(counts)) return(draw_message("No China provincial, Hong Kong, or Taiwan affiliations are available."))
+    points <- left_join(china_region_coordinates, counts, by = "Region")
+    mainland <- if (requireNamespace("maps", quietly = TRUE)) {
+      ggplot2::map_data("world") |> filter(region %in% c("China", "Taiwan"))
+    } else tibble(long = numeric(), lat = numeric(), group = numeric())
+    ggplot() +
+      geom_polygon(data = mainland, aes(long, lat, group = group), fill = "grey94", colour = "white", linewidth = .25) +
+      geom_point(data = points, aes(lon, lat, size = Count, colour = Count), na.rm = TRUE) +
+      geom_text(data = points, aes(lon, lat, label = ifelse(is.na(Count), Region, paste0(Region, " (", Count, ")"))), size = 3, vjust = -0.7, na.rm = TRUE) +
+      scale_size_continuous(range = c(2, 11), guide = "none") +
+      scale_colour_gradient(low = "#dbeafe", high = "#08306b", name = "Articles\n(n)") +
+      coord_fixed(xlim = c(73, 135), ylim = c(17, 54), expand = FALSE) +
+      labs(title = "FA/CA China regions", subtitle = "Province-level counts, including Hong Kong and Taiwan") +
+      theme_minimal(base_size = 12) + theme(axis.title = element_blank(), plot.title = element_text(hjust = .5, face = "bold"), plot.subtitle = element_text(hjust = .5))
+  })
   output$country_choropleth_counts <- renderTable({ fa_ca_country_counts() |> select(Country, Count) }, striped = TRUE, bordered = TRUE)
   output$country_choropleth <- renderPlot({
+    counts <- fa_ca_country_counts()
+    if (!nrow(counts)) return(draw_message("No FA/CA country values are available."))
+    if (!requireNamespace("maps", quietly = TRUE)) return(draw_message("Install the maps package to render the country choropleth."))
+    world <- ggplot2::map_data("world")
+    mapped <- left_join(world, counts, by = c("region" = "map_region"))
+    # Counts span several orders of magnitude (e.g., US=563 vs China=12).
+    # A log colour scale keeps lower non-zero country counts visible while the
+    # legend labels remain the original article counts.
+    mapped$map_count <- log10(mapped$Count + 1)
+    legend_counts <- unique(c(1, 2, 3, 5, 10, 20, 50, 100, 200, 500, max(counts$Count)))
+    legend_counts <- sort(legend_counts[legend_counts <= max(counts$Count)])
+    ggplot(mapped, aes(long, lat, group = group, fill = map_count)) +
+      geom_polygon(colour = "white", linewidth = .15) +
+      coord_quickmap() +
+      scale_fill_gradient(low = "#dbeafe", high = "#08306b", na.value = "grey92", name = "Articles\n(n)", breaks = log10(legend_counts + 1), labels = legend_counts) +
+      labs(title = "FA/CA countries by article count", subtitle = "Log colour scale; each country is counted once per article across FA_Country and CA_Country") +
+      theme_void(base_size = 14) + theme(plot.title = element_text(face = "bold", hjust = .5), plot.subtitle = element_text(hjust = .5), legend.position = "right")
+  })
+  output$region_world_choropleth_counts <- renderTable({ fa_ca_country_counts() |> select(Country, Count) }, striped = TRUE, bordered = TRUE)
+  output$region_world_choropleth <- renderPlot({
     counts <- fa_ca_country_counts()
     if (!nrow(counts)) return(draw_message("No FA/CA country values are available."))
     if (!requireNamespace("maps", quietly = TRUE)) return(draw_message("Install the maps package to render the country choropleth."))
@@ -1120,29 +1350,29 @@ observeEvent(input$extract_article_content, {
     result
   }
   draw_message <- function(message) { plot.new(); text(.5, .5, message, cex = 1.1) }
-  draw_reduced <- function(result, title) {
+  draw_reduced <- function(result, title, region_style = FALSE) {
     if (is.null(result) || inherits(result, "flca_error")) return(draw_message(if (is.null(result)) "Not enough co-occurrences for FLCA." else result$message))
-    nd <- result$modes; ed <- result$data; n <- nrow(nd); th <- seq(0, 2*pi, length.out=n+1)[-(n+1)]; xy <- data.frame(name=nd$name,x=cos(th),y=sin(th),carac=as.factor(nd$carac),value=nd$value)
+    nd <- result$modes; ed <- result$data; n <- nrow(nd); th <- seq(0, 2*pi, length.out=n+1)[-(n+1)]; xy <- data.frame(name=nd$name,x=cos(th),y=sin(th),carac=as.factor(nd$carac),value=nd$value); xy$display <- if (region_style) region_visual_label(xy$name) else xy$name; xy$text_col <- if (region_style) region_visual_colour(xy$name) else "black"
     plot(xy$x,xy$y,type="n",xlim=c(-1.35,1.35),ylim=c(-1.35,1.35),axes=FALSE,xlab="",ylab="",main=title,font.main=2)
     pal <- grDevices::hcl.colors(max(3,length(unique(xy$carac))),"Dark 3"); cols <- setNames(pal,sort(unique(xy$carac)))
     if(nrow(ed)) for(i in seq_len(nrow(ed))){a<-xy[match(ed$Leader,xy$name),];b<-xy[match(ed$Follower,xy$name),];segments(a$x,a$y,b$x,b$y,col="grey65",lwd=1+log1p(ed$WCD[i]))}
-    points(xy$x,xy$y,pch=21,bg=cols[as.character(xy$carac)],cex=1.5+2*xy$value/max(xy$value),col="grey10"); text(xy$x,xy$y,xy$name,cex=1.05,font=2)
+    points(xy$x,xy$y,pch=21,bg=cols[as.character(xy$carac)],cex=1.5+2*xy$value/max(xy$value),col="grey10"); text(xy$x,xy$y,xy$display,cex=1.05,font=2,col=xy$text_col)
   }
-  draw_sankey <- function(result, title) {
+  draw_sankey <- function(result, title, region_style = FALSE) {
     if (is.null(result) || inherits(result, "flca_error")) return(draw_message("Not enough FLCA links for Sankey plot."))
     nd <- as.data.frame(result$modes); ed <- as.data.frame(result$data); nd$name <- as.character(nd$name); nd$value <- as.numeric(nd$value); nd$carac <- as.integer(nd$carac)
-    nd <- nd[order(nd$carac, -nd$value, nd$name), , drop = FALSE]; nd$y <- seq_len(nrow(nd)); ymap <- setNames(nd$y, nd$name); nd$lab <- sprintf("%s (%.0f; C%s)", nd$name, nd$value, nd$carac)
+    nd <- nd[order(nd$carac, -nd$value, nd$name), , drop = FALSE]; nd$y <- seq_len(nrow(nd)); ymap <- setNames(nd$y, nd$name); nd$lab <- sprintf("%s (%.0f; C%s)", if (region_style) region_visual_label(nd$name) else nd$name, nd$value, nd$carac); nd$text_col <- if (region_style) region_visual_colour(nd$name) else "black"
     ed <- ed[ed$Leader %in% nd$name & ed$Follower %in% nd$name & is.finite(ed$WCD) & ed$WCD > 0, , drop = FALSE]; ed$y1 <- ymap[ed$Leader]; ed$y2 <- ymap[ed$Follower]
     pal <- grDevices::hcl.colors(max(3, length(unique(nd$carac))), "Dark 3"); node_col <- setNames(pal[match(nd$carac, sort(unique(nd$carac)))], nd$name)
     old <- par(no.readonly=TRUE); on.exit(par(old),add=TRUE); par(mar=c(5,16,4,16),xpd=NA)
     plot(NA,xlim=c(0,1),ylim=c(nrow(nd)+1.2,0),axes=FALSE,xlab="",ylab="",main=title,cex.main=1.45,font.main=2)
     L <- c(.12,.18); R <- c(.82,.88); h <- .32
-    for(k in seq_len(nrow(nd))){rect(L[1],nd$y[k]-h,L[2],nd$y[k]+h,col=node_col[nd$name[k]],border="grey25");rect(R[1],nd$y[k]-h,R[2],nd$y[k]+h,col=node_col[nd$name[k]],border="grey25");text(L[1]-.015,nd$y[k],nd$lab[k],adj=c(1,.5),cex=.95,font=2);text(R[2]+.015,nd$y[k],nd$lab[k],adj=c(0,.5),cex=.95,font=2)}
+    for(k in seq_len(nrow(nd))){rect(L[1],nd$y[k]-h,L[2],nd$y[k]+h,col=node_col[nd$name[k]],border="grey25");rect(R[1],nd$y[k]-h,R[2],nd$y[k]+h,col=node_col[nd$name[k]],border="grey25");text(L[1]-.015,nd$y[k],nd$lab[k],adj=c(1,.5),cex=.95,font=2,col=nd$text_col[k]);text(R[2]+.015,nd$y[k],nd$lab[k],adj=c(0,.5),cex=.95,font=2,col=nd$text_col[k])}
     text(mean(L),.2,"Leader",cex=1.2,font=2);text(mean(R),.2,"Follower",cex=1.2,font=2)
     if(nrow(ed)){mw<-max(ed$WCD);for(k in seq_len(nrow(ed))){t<-seq(0,1,length.out=90);x<-(L[2]+.01)+(R[1]-L[2]-.02)*t;e<-3*t^2-2*t^3;ym<-(1-e)*ed$y1[k]+e*ed$y2[k];hw<-.025+.14*ed$WCD[k]/mw;polygon(c(x,rev(x)),c(ym-hw,rev(ym+hw)),col=grDevices::adjustcolor(node_col[ed$Leader[k]],alpha.f=.48),border=NA);lines(x,ym,col=grDevices::adjustcolor("grey20",alpha.f=.35),lwd=.8)}}
     mtext("Identical FLCA Top-20 nodes at both sides; ribbon width = WCD; colours = leader cluster.",side=1,line=2,cex=.95,font=2)
   }
-  draw_chord <- function(result, title) {
+  draw_chord <- function(result, title, region_style = FALSE) {
     if (is.null(result) || inherits(result, "flca_error")) return(draw_message("Not enough FLCA links for chord plot."))
     if (!requireNamespace("circlize", quietly = TRUE)) return(draw_message("Install circlize for the chord diagram."))
     nd <- result$modes; ed <- result$data; groups <- sort(unique(as.character(nd$carac)))
@@ -1150,7 +1380,7 @@ observeEvent(input$extract_article_content, {
     grid_col <- setNames(unname(cols[as.character(nd$carac)]), nd$name)
     circlize::circos.clear(); on.exit(circlize::circos.clear(), add = TRUE)
     circlize::chordDiagram(ed[, c("Leader", "Follower", "WCD")], grid.col = grid_col, transparency = .25, annotationTrack = "grid", preAllocateTracks = list(track.height = .12))
-    circlize::circos.trackPlotRegion(track.index = 1, panel.fun = function(x, y) { sector <- circlize::get.cell.meta.data("sector.index"); circlize::circos.text(circlize::get.cell.meta.data("xcenter"), circlize::get.cell.meta.data("ylim")[1], sector, facing = "clockwise", niceFacing = TRUE, adj = c(0, .5), cex = 1.05, font = 2) }, bg.border = NA)
+    circlize::circos.trackPlotRegion(track.index = 1, panel.fun = function(x, y) { sector <- circlize::get.cell.meta.data("sector.index"); circlize::circos.text(circlize::get.cell.meta.data("xcenter"), circlize::get.cell.meta.data("ylim")[1], if (region_style) region_visual_label(sector) else sector, facing = "clockwise", niceFacing = TRUE, adj = c(0, .5), cex = 1.05, font = 2, col = if (region_style) region_visual_colour(sector) else "black") }, bg.border = NA)
     title(title, cex.main = 1.5, font.main = 2, cex.main = 1.35)
   }
   make_ss_results <- function(result) {
@@ -1169,7 +1399,7 @@ observeEvent(input$extract_article_content, {
     rows <- filter(rows, term %in% top); yrs <- sort(unique(rows$year)); grid <- expand.grid(term=top,year=yrs,stringsAsFactors=FALSE); rows <- left_join(grid,rows,by=c("term","year")) |> mutate(value=ifelse(is.na(value),0,value))
     wide <- xtabs(value ~ term + year, data=rows); wide <- wide[order(wide[,1],rownames(wide)),,drop=FALSE]; gap <- max(.5,.05*diff(range(wide))); shifts <- numeric(nrow(wide)); if(nrow(wide)>1) for(k in 2:nrow(wide)){dm<-min(diff(as.matrix(wide[(k-1):k,,drop=FALSE])));shifts[k]<-ifelse(is.finite(dm)&&dm<gap,gap-dm,0)}; shifts<-cumsum(shifts)
     sl <- do.call(rbind,lapply(seq_along(yrs),function(j)data.frame(term=rownames(wide),year=yrs[j],value=as.numeric(wide[,j]),ypos=as.numeric(wide[,j])+shifts))); sl <- sl |> group_by(term) |> mutate(at_or_above_mean = value >= mean(value, na.rm = TRUE)) |> ungroup(); first<-sl[sl$year==yrs[1],,drop=FALSE]
-    ggplot(sl,aes(year,ypos))+geom_line(aes(group=term),colour="red",linewidth=1)+geom_point(aes(fill=at_or_above_mean,colour=at_or_above_mean),shape=21,size=5,stroke=1)+geom_text(aes(label=ifelse(value>0,value,"")),size=4,fontface="bold")+scale_fill_manual(values=c(`FALSE`="white",`TRUE`="blue"),guide="none")+scale_colour_manual(values=c(`FALSE`="grey35",`TRUE`="blue"),guide="none")+scale_x_continuous(breaks=yrs)+scale_y_continuous("",breaks=first$ypos,labels=first$term)+labs(title=paste(label,"Top-20 FLCA terms by publication year"),x="Publication year")+theme_classic(base_size=15)+theme(axis.title.y=element_blank(),plot.title=element_text(face="bold",hjust=.5,size=18),axis.text=element_text(face="bold"),plot.margin=margin(10,15,10,25),axis.text.y=element_text(margin=margin(r=4)))
+    ggplot(sl,aes(year,ypos))+geom_line(aes(group=term),colour="red",linewidth=1)+geom_point(aes(fill=at_or_above_mean,colour=at_or_above_mean),shape=21,size=5,stroke=1)+geom_text(aes(label=ifelse(value>0,value,"")),size=4,fontface="bold")+scale_fill_manual(values=c(`FALSE`="white",`TRUE`="#fff3b0"),guide="none")+scale_colour_manual(values=c(`FALSE`="grey35",`TRUE`="#b8860b"),guide="none")+scale_x_continuous(breaks=yrs)+scale_y_continuous("",breaks=first$ypos,labels=first$term)+labs(title=paste(label,"Top-20 FLCA terms by publication year"),x="Publication year")+theme_classic(base_size=15)+theme(axis.title.y=element_blank(),plot.title=element_text(face="bold",hjust=.5,size=18),axis.text=element_text(face="bold"),plot.margin=margin(10,15,10,25),axis.text.y=element_text(margin=margin(r=4)))
   }
 
   cited_reference_slope <- function() {
@@ -1192,13 +1422,13 @@ observeEvent(input$extract_article_content, {
   register_flca_outputs <- function(id, net, label) {
     real <- reactive(flca_result_cached(id, net()))
     output[[paste0(id,"_nodes")]] <- renderTable({ n <- net()$nodes; if (!nrow(n)) return(data.frame(Status = "No terms available.")); names(n) <- c("Node", "Count"); n }, striped = TRUE, bordered = TRUE)
-    output[[paste0(id,"_full")]] <- renderPlot(draw_network(net(), paste(label,"full co-occurrence network")))
-    output[[paste0(id,"_reduced")]] <- renderPlot(draw_reduced(real(), paste(label,"real FLCA Top-20 reduced network")))
-    output[[paste0(id,"_sankey")]] <- renderPlot(draw_sankey(real(), paste(label,"FLCA Sankey plot")))
-    output[[paste0(id,"_chord")]] <- renderPlot(draw_chord(real(), paste(label,"FLCA chord plot")))
+    output[[paste0(id,"_full")]] <- renderPlot(draw_network(net(), paste(label,"full co-occurrence network"), region_style = id == "regions"))
+    output[[paste0(id,"_reduced")]] <- renderPlot(draw_reduced(real(), paste(label,"real FLCA Top-20 reduced network"), region_style = id == "regions"))
+    output[[paste0(id,"_sankey")]] <- renderPlot(draw_sankey(real(), paste(label,"FLCA Sankey plot"), region_style = id == "regions"))
+    output[[paste0(id,"_chord")]] <- renderPlot(draw_chord(real(), paste(label,"FLCA chord plot"), region_style = id == "regions"))
     output[[paste0(id,"_ss")]] <- renderPlot({ r<-real(); if(is.null(r)||inherits(r,"flca_error")) draw_message("Not enough data for SSPlot.") else { source("renderSSplot.R",local=TRUE); s<-r$modes; s$sil_width<-s$ssi; render_panel(s,make_nodes0(s),results=make_ss_results(r),nodes=s,top_n=min(20,nrow(s)),font_scale=1.15) } })
     output[[paste0(id,"_kano")]] <- renderPlot({ r<-real(); if(is.null(r)||inherits(r,"flca_error")) draw_message("Not enough data for Kano plot.") else { source("kano.R",local=TRUE); print(plot_kano_real(r$modes,edges=r$data,title_txt=paste(label,"Kano plot"),visual_ratio=1)) } })
-    output[[paste0(id,"_slope")]] <- renderPlot({ if (id == "cited_references") { p <- cited_reference_slope() } else p <- entity_slope(switch(id, authors=c("FA_Author","CA_Author"), first_authors=c("FA_Author"), corresponding_authors=c("CA_Author"), first_author_countries=c("FA_Country"), first_author_institutes=c("FA_Institute"), first_author_departments=c("FA_Department"), corresponding_author_countries=c("CA_Country"), corresponding_author_institutes=c("CA_Institute"), corresponding_author_departments=c("CA_Department"), keywords=c("Author_Keywords","Keywords"), index_keywords=c("Index_Keywords"), countries=c("FA_Country","CA_Country"), institutes=c("FA_Institute","CA_Institute"), departments=c("FA_Department","CA_Department")), label); if(is.null(p)) draw_message("No dated terms available for slope plot.") else print(p) })
+    output[[paste0(id,"_slope")]] <- renderPlot({ if (id == "cited_references") { p <- cited_reference_slope() } else p <- entity_slope(switch(id, authors=c("FA_Author","CA_Author"), first_authors=c("FA_Author"), corresponding_authors=c("CA_Author"), first_author_countries=c("FA_Country"), first_author_institutes=c("FA_Institute"), first_author_departments=c("FA_Department"), corresponding_author_countries=c("CA_Country"), corresponding_author_institutes=c("CA_Institute"), corresponding_author_departments=c("CA_Department"), keywords=c("Author_Keywords","Keywords"), index_keywords=c("Index_Keywords"), countries=c("FA_Country","CA_Country"), institutes=c("FA_Institute","CA_Institute"), departments=c("FA_Department","CA_Department"), regions=c("FA_Region","CA_Region")), label); if(is.null(p)) draw_message("No dated terms available for slope plot.") else print(p) })
     output[[paste0(id,"_clusters")]] <- renderTable({ r<-real(); if(is.null(r)||inherits(r,"flca_error")) return(data.frame(Status="Not enough co-occurrences for FLCA.")); r$modes }, striped=TRUE,bordered=TRUE)
     output[[paste0(id,"_edges")]] <- renderTable({ r<-real(); if(is.null(r)||inherits(r,"flca_error")) return(NULL); r$data }, striped=TRUE,bordered=TRUE)
   }
@@ -1216,6 +1446,7 @@ observeEvent(input$extract_article_content, {
   register_flca_outputs("countries", country_net, "FA/CA countries")
   register_flca_outputs("institutes", institute_net, "FA/CA institutes")
   register_flca_outputs("departments", department_net, "FA/CA departments")
+  register_flca_outputs("regions", region_net, "FA/CA regions")
   output$abbreviated_source_titles_nodes <- renderTable({
     n <- abbreviated_source_title_net()$nodes
     if (!nrow(n)) return(data.frame(Status = "No abbreviated source titles available."))
@@ -1238,6 +1469,7 @@ observeEvent(input$extract_article_content, {
       summary_domain(x,"FA/CA countries",c("FA_Country","CA_Country")),
       summary_domain(x,"FA/CA institutes",c("FA_Institute","CA_Institute")),
       summary_domain(x,"FA/CA departments",c("FA_Department","CA_Department")),
+      summary_domain(x,"FA/CA regions",c("FA_Region","CA_Region")),
       summary_domain(x,"Journal",c("Journal")),
       summary_domain(x,"Author keywords",c("Author_Keywords")),
       summary_domain(x,"Index keywords",c("Index_Keywords")),
