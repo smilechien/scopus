@@ -706,16 +706,67 @@ draw_summary_report <- function(summary_df, n_articles = NA_integer_, dataset_h 
   mtext(title,outer=TRUE,font=2,cex=2.85,line=1)
 }
 
-# Demo 2: generic group-comparison Rating Scale Model (RSM).
+# PubMed author AAC trend. AAC uses the top three first/last-author counts.
+pubmed_aac_value <- function(counts) {
+  v <- sort(as.numeric(counts), decreasing = TRUE); v <- v[is.finite(v) & v > 0]
+  if (length(v) < 3L || v[2] <= 0) return(NA_real_)
+  gamma <- v[1] * v[3] / v[2]^2
+  gamma / (1 + gamma)
+}
+pubmed_first_last_authors <- function(xml_text) {
+  articles <- regmatches(xml_text, gregexpr("<PubmedArticle\\b[\\s\\S]*?</PubmedArticle>", xml_text, perl = TRUE))[[1]]
+  unlist(lapply(articles, function(article) {
+    blocks <- regmatches(article, gregexpr("<Author(?: [^>]*)?>[\\s\\S]*?</Author>", article, perl = TRUE))[[1]]
+    authors <- vapply(blocks, function(block) {
+      last <- sub(".*?<LastName>([^<]+)</LastName>.*", "\\1", block, perl = TRUE)
+      fore <- sub(".*?<ForeName>([^<]+)</ForeName>.*", "\\1", block, perl = TRUE)
+      if (identical(last, block)) return("")
+      if (identical(fore, block)) fore <- ""
+      trimws(paste(last, fore))
+    }, character(1))
+    authors <- authors[nzchar(authors)]
+    if (length(authors) == 1L) authors else if (length(authors) > 1L) unique(c(authors[1], authors[length(authors)])) else character()
+  }), use.names = FALSE)
+}
+pubmed_esearch <- function(query, retmax) {
+  url <- paste0("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&retmode=json&retmax=", as.integer(retmax), "&term=", curl::curl_escape(query))
+  body <- rawToChar(curl::curl_fetch_memory(url)$content)
+  out <- jsonlite::fromJSON(body)$esearchresult
+  list(count = suppressWarnings(as.integer(out$count)), ids = as.character(out$idlist %||% character()))
+}
+pubmed_efetch_xml <- function(ids) {
+  url <- paste0("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pubmed&rettype=xml&id=", paste(ids, collapse = ","))
+  rawToChar(curl::curl_fetch_memory(url)$content)
+}
+compute_pubmed_author_aac <- function(author, retmax = 200L) {
+  result_row <- function(status, query = NA_character_, hits = NA_integer_, fetched = 0L) tibble(Input_author = author, PubMed_query = query, PubMed_hits = hits, Fetched_records = fetched, Top1_author = NA_character_, Top1_n = NA_integer_, Top2_author = NA_character_, Top2_n = NA_integer_, Top3_author = NA_character_, Top3_n = NA_integer_, AAC = NA_real_, Status = status)
+  author <- trimws(as.character(author)); if (!nzchar(author)) return(result_row("Blank author name"))
+  query <- if (grepl("\\[Author\\]", author, ignore.case = TRUE)) author else paste0(author, "[Author]")
+  search <- tryCatch(pubmed_esearch(query, retmax), error = function(e) e)
+  if (inherits(search, "error")) return(result_row(paste("PubMed search failed:", conditionMessage(search)), query))
+  hits <- search$count; ids <- search$ids
+  if (!length(ids)) return(result_row("No PubMed records found", query, hits, 0L))
+  if (is.finite(hits) && hits > length(ids)) return(result_row(paste0("AAC skipped: ", hits, " hits exceed fetch limit ", retmax, ". Refine the author query or raise the limit."), query, hits, length(ids)))
+  Sys.sleep(.34); xml <- tryCatch(pubmed_efetch_xml(ids), error = function(e) e)
+  if (inherits(xml, "error")) return(result_row(paste("PubMed fetch failed:", conditionMessage(xml)), query, hits, length(ids)))
+  tab <- sort(table(pubmed_first_last_authors(xml)), decreasing = TRUE)
+  if (length(tab) < 3L) return(result_row("AAC needs at least three first/last authors", query, hits, length(ids)))
+  tibble(Input_author = author, PubMed_query = query, PubMed_hits = hits, Fetched_records = length(ids), Top1_author = names(tab)[1], Top1_n = as.integer(tab[1]), Top2_author = names(tab)[2], Top2_n = as.integer(tab[2]), Top3_author = names(tab)[3], Top3_n = as.integer(tab[3]), AAC = pubmed_aac_value(as.numeric(tab[1:3])), Status = "OK")
+}# Demo 2: generic group-comparison Rating Scale Model (RSM).
 # CSV convention: first column = ID, final column = group; numeric middle columns = items.
 read_demo2_csv <- function(path) {
   x <- tryCatch(utils::read.csv(path, stringsAsFactors = FALSE, check.names = FALSE, na.strings = c("", "."), fileEncoding = "UTF-8-BOM"), error = function(e) NULL)
-  validate(need(!is.null(x) && nrow(x) >= 3 && ncol(x) >= 4, "Demo 2 CSV needs an ID column, at least two numeric items, a group column, and three records."))
-  for (j in 2:(ncol(x) - 1)) if (is.character(x[[j]])) {
-    value <- suppressWarnings(as.numeric(gsub(",", "", trimws(x[[j]]), fixed = TRUE)))
-    present <- !is.na(x[[j]]) & nzchar(trimws(x[[j]]))
-    if (!any(present) || all(is.finite(value[present]))) x[[j]] <- value
-  }
+  validate(need(!is.null(x) && ncol(x) >= 4, "Demo 2 CSV needs an ID column, at least two numeric items, and a final group column."))
+  item_index <- 2:(ncol(x) - 1)
+  values <- lapply(item_index, function(j) suppressWarnings(as.numeric(gsub(",", "", trimws(as.character(x[[j]])), fixed = TRUE))))
+  observed_by_row <- rowSums(do.call(cbind, lapply(values, is.finite)))
+  keep <- observed_by_row > 0L
+  removed <- sum(!keep)
+  x <- x[keep, , drop = FALSE]
+  values <- lapply(values, function(v) v[keep])
+  for (k in seq_along(item_index)) x[[item_index[k]]] <- values[[k]]
+  attr(x, "demo2_removed_empty_rows") <- removed
+  validate(need(nrow(x) >= 3, "After empty or non-numeric rows were removed, Demo 2 needs at least three valid records."))
   x
 }
 fit_demo2_rsm <- function(raw, categories = 4L, iterations = 60L) {
@@ -762,14 +813,15 @@ draw_demo2_group_forest <- function(fit, kid = 1L) {
   d <- bind_rows(d |> mutate(Selected = FALSE), tibble(Group = as.character(chosen$Group), N = 1L, Measure = chosen$Measure, SD = NA_real_, SE = chosen$SE, Label = paste0("KID#", kid, ": ", chosen$Person, " [", chosen$Group, "]"), Selected = TRUE))
   d$SE[!is.finite(d$SE)] <- 0; d <- d |> arrange(Selected, Measure); d$Lower <- d$Measure - d$SE; d$Upper <- d$Measure + d$SE
   y <- rev(seq_len(nrow(d))); limits <- range(c(d$Lower, d$Upper, 0), na.rm = TRUE); padding <- max(.25, diff(limits) * .12); limits <- limits + c(-padding, padding)
-  par(mar = c(4.5, 16, 4.5, 6), xpd = NA); plot(NA, xlim = limits, ylim = c(.5, nrow(d) + .5), yaxt = "n", xlab = "Rasch Rating Scale Model measure (logits; bars = ±1 SE)", ylab = "", main = paste0("Profile-group comparison with KID#", kid))
-  abline(v = 0, lty = 2, col = "grey55"); axis(2, y, labels = FALSE); text(limits[1], y, labels = d$Label, pos = 2, offset = .55, cex = .80, font = ifelse(tolower(d$Group) == "usa", 2, 1), col = ifelse(tolower(d$Group) == "usa", "#143E7A", "black")); segments(d$Lower, y, d$Upper, y, lwd = 2, col = ifelse(tolower(d$Group) == "usa", "#143E7A", "#6B7280")); points(d$Measure, y, pch = ifelse(d$Selected, 18, 19), cex = ifelse(d$Selected, 1.5, 1.15), col = ifelse(d$Selected, "#D94801", ifelse(tolower(d$Group) == "usa", "#143E7A", "#149B52"))); text(limits[2], y, sprintf("%.2f [%.2f, %.2f]", d$Measure, d$Lower, d$Upper), pos = 2, offset = .45, cex = .8)
+  par(mar = c(4.5, 16, 4.5, 6), xpd = NA); plot(NA, xlim = limits, ylim = c(.5, nrow(d) + .5), yaxt = "n", xlab = "Rasch Rating Scale Model measure (logits; bars = ±1 SE)", ylab = "", main = paste0("Profile-group comparison with KID#", kid), bty = "n")
+  abline(v = 0, lty = 2, col = "grey55"); text(limits[1], y, labels = sub(" \\(n=([0-9]+)\\)$", " (\\1)", d$Label), pos = 2, offset = .55, cex = .80, font = ifelse(tolower(d$Group) == "usa", 2, 1), col = ifelse(tolower(d$Group) == "usa", "#143E7A", "black")); segments(d$Lower, y, d$Upper, y, lwd = 2, col = ifelse(tolower(d$Group) == "usa", "#143E7A", "#6B7280")); points(d$Measure, y, pch = ifelse(d$Selected, 18, 19), cex = ifelse(d$Selected, 1.5, 1.15), col = ifelse(d$Selected, "#D94801", ifelse(tolower(d$Group) == "usa", "#143E7A", "#149B52"))); text(limits[2], y, sprintf("%.2f [%.2f, %.2f]", d$Measure, d$Lower, d$Upper), pos = 2, offset = .45, cex = .8)
 }
 ui <- fluidPage(
   titlePanel("Scopus Metadata via FLCAr based on FA/CA authors"),
-  tags$head(tags$style(HTML(".flca-entity-heading { font-weight: 700; color: #1f4e79; margin-top: 14px; } .tab-content { overflow-x: auto; } .nav-tabs > li.active > a, .nav-tabs > li.active > a:hover, .nav-tabs > li.active > a:focus, .nav-pills > li.active > a, .nav-pills > li.active > a:hover, .nav-pills > li.active > a:focus { color: #fff !important; background-color: #c9302c !important; border-color: #a52824 !important; font-weight: 700; }"))),
+  tags$head(tags$style(HTML(".flca-entity-heading { font-weight: 700; color: #1f4e79; margin-top: 14px; } .sidebar-section-title { color: #c9302c; font-size: 18px; font-weight: 700; border-bottom: 2px solid #c9302c; margin: 8px 0 10px; padding-bottom: 4px; } .tab-content { overflow-x: auto; } .nav-tabs > li.active > a, .nav-tabs > li.active > a:hover, .nav-tabs > li.active > a:focus, .nav-pills > li.active > a, .nav-pills > li.active > a:hover, .nav-pills > li.active > a:focus { color: #fff !important; background-color: #c9302c !important; border-color: #a52824 !important; font-weight: 700; }"))),
   sidebarLayout(
     sidebarPanel(width = 3,
+      tags$div(class = "sidebar-section-title", "1. Bibliometrics"),
       tags$h4("Demo data"),
       actionButton("run_demo", "Run supplied Scopus demo", class = "btn-primary btn-block"),
       helpText("Loads the bundled 607-record Scopus export and builds the FLCA visualisations."),
@@ -792,13 +844,18 @@ ui <- fluidPage(
       textAreaInput("article_content", "Article content (authors are ignored)", value = default_article_content, rows = 9),
       fluidRow(column(7, actionButton("extract_article_content", "Extract keywords", class = "btn-success btn-block")), column(5, actionButton("clear_article_content", "Clear content", class = "btn-default btn-block"))),
       sliderInput("graphical_phrase_min", "Minimum keyphrase occurrences", min = 1, max = 10, value = 2, step = 1),
-      tags$hr(), tags$h4("Demo 2: Rasch group forest"),
+      tags$hr(), tags$div(class = "sidebar-section-title", "2. Forest plot"), tags$h4("Demo 2: Rasch group forest"),
       helpText("Top-2% scientists: first column = name, the 11 numeric middle columns = items, and final profile column = group. Each item is Z-standardized then categorized 0–4."),
       downloadButton("download_demo2", "Download data2.csv", class = "btn-default btn-block"),
       actionButton("run_demo2", "Run Demo 2 RSM forest", class = "btn-success btn-block"),
       numericInput("demo2_kid", "Selected KID# for forest comparison", value = 1, min = 1, step = 1),
       fileInput("demo2_csv", "Or upload a group-comparison CSV", accept = c("text/csv", ".csv"), buttonLabel = "Browse..."),
-      actionButton("run_demo2_upload", "Run uploaded RSM forest", class = "btn-primary btn-block")
+      actionButton("run_demo2_upload", "Run uploaded RSM forest", class = "btn-primary btn-block"),
+      tags$hr(), tags$div(class = "sidebar-section-title", "3. AAC via PubMed"), tags$h4("PubMed author AAC trend"),
+      textAreaInput("pubmed_aac_authors", "Authors (one name per line)", placeholder = "Smith J\nWang Y\nChen L", rows = 7),
+      numericInput("pubmed_aac_retmax", "Maximum PubMed records per author", value = 200, min = 3, max = 1000, step = 50),
+      actionButton("run_pubmed_aac", "Search PubMed and compute AAC", class = "btn-danger btn-block"),
+      helpText("AAC is calculated only when all matching PubMed records are fetched.")
     ),
     mainPanel(width = 9,
       tabsetPanel(id = "main_tabs",
@@ -861,6 +918,12 @@ ui <- fluidPage(
           h4("Group estimates"), tableOutput("demo2_group_table"),
           h4("RSM item estimates"), tableOutput("demo2_item_table")
         ),
+        tabPanel("PubMed AAC trend",
+          h3("PubMed author AAC trend"),
+          textOutput("pubmed_aac_status"), br(),
+          plotOutput("pubmed_aac_trend", height = "550px"),
+          h4("PubMed author AAC results"), tableOutput("pubmed_aac_table")
+        ),
         tabPanel("ReadMe",
           h3("Scopus FLCA workflow"),
           tags$ol(
@@ -894,6 +957,29 @@ server <- function(input, output, session) {
   article_references <- reactiveVal(parse_mdpi_references(default_scopus_references))
   graphical_abstract <- reactiveVal(extract_article_content_terms(default_article_content))
   selected_scopus_csv <- reactiveVal(NULL)
+  pubmed_aac_results <- reactiveVal(NULL)
+  pubmed_aac_status_value <- reactiveVal("Paste one author name per line, then search PubMed.")
+  observeEvent(input$run_pubmed_aac, {
+    author_text <- gsub("\r\n?", "\n", input$pubmed_aac_authors %||% "")
+    authors <- trimws(strsplit(author_text, "\n", fixed = TRUE)[[1]])
+    authors <- authors[nzchar(authors)]
+    if (!length(authors)) { pubmed_aac_status_value("Enter at least one author name."); updateTabsetPanel(session, "main_tabs", selected = "PubMed AAC trend"); return() }
+    if (length(authors) > 100L) { pubmed_aac_status_value("Search no more than 100 authors at a time."); updateTabsetPanel(session, "main_tabs", selected = "PubMed AAC trend"); return() }
+    pubmed_aac_status_value(paste0("Input contains ", length(authors), " non-empty author line(s). Searching PubMed...")); pubmed_aac_results(NULL)
+    results <- tryCatch(withProgress(message = "PubMed author AAC", value = 0, {
+      out <- vector("list", length(authors))
+      for (i in seq_along(authors)) { incProgress(1 / length(authors), detail = paste0(i, "/", length(authors), ": ", authors[i])); out[[i]] <- compute_pubmed_author_aac(authors[i], as.integer(input$pubmed_aac_retmax)); if (i < length(authors)) Sys.sleep(.34) }
+      bind_rows(out)
+    }), error = function(e) e)
+    if (inherits(results, "error")) { pubmed_aac_status_value(paste("PubMed AAC failed:", conditionMessage(results))); updateTabsetPanel(session, "main_tabs", selected = "PubMed AAC trend"); return() }
+    results$Sequence <- seq_len(nrow(results)); pubmed_aac_results(results)
+    valid <- results$AAC[is.finite(results$AAC)]
+    pubmed_aac_status_value(paste0("Completed ", nrow(results), " author searches; ", length(valid), " valid AAC estimates. Mean AAC = ", if(length(valid)) sprintf("%.3f", mean(valid)) else "NA", "; median AAC = ", if(length(valid)) sprintf("%.3f", median(valid)) else "NA", "."))
+    updateTabsetPanel(session, "main_tabs", selected = "PubMed AAC trend")
+  })
+  output$pubmed_aac_status <- renderText(pubmed_aac_status_value())
+  output$pubmed_aac_trend <- renderPlot({ d <- pubmed_aac_results(); req(!is.null(d)); valid <- d |> filter(is.finite(AAC)); validate(need(nrow(valid) > 0, "No valid AAC estimates. Check the result status and refine author queries.")); ggplot(valid, aes(x = Sequence, y = AAC)) + geom_hline(yintercept = .70, linetype = "dotted", linewidth = 1, color = "#1565C0") + geom_line(color = "red", linewidth = 1.15) + geom_point(color = "red", size = 2.8) + scale_x_continuous(breaks = pretty(valid$Sequence, n = min(10, nrow(valid)))) + coord_cartesian(ylim = c(0, 1)) + labs(title = "AAC for PubMed authors", subtitle = paste0("Mean = ", sprintf("%.3f", mean(valid$AAC)), "; median = ", sprintf("%.3f", median(valid$AAC)), "; blue dotted reference = 0.70"), x = "Sequential author number", y = "AAC") + theme_minimal(base_size = 14) })
+  output$pubmed_aac_table <- renderTable({ d <- pubmed_aac_results(); req(!is.null(d)); d |> select(Sequence, Input_author, PubMed_hits, Fetched_records, Top1_author, Top1_n, Top2_author, Top2_n, Top3_author, Top3_n, AAC, Status) }, digits = 3, striped = TRUE, bordered = TRUE)
   demo2_path <- reactiveVal(NULL)
   demo2_fit <- reactiveVal(NULL)
   demo2_status_value <- reactiveVal("Choose Run Demo 2 or select an upload, then click Run uploaded RSM forest.")
@@ -902,7 +988,7 @@ server <- function(input, output, session) {
   run_demo2_analysis <- function(path) {
     demo2_status_value("Running: 1) Z-standardizing each item; 2) categorizing to 0–4; 3) fitting the Rating Scale Model by profile group.")
     result <- tryCatch(withProgress(message = "Running Demo 2 Rating Scale Model", value = 0, {
-      incProgress(.15, detail = "Reading dot/blank values as missing")
+      incProgress(.15, detail = "Reading CSV and removing empty/non-numeric rows")
       raw <- read_demo2_csv(path)
       incProgress(.45, detail = "Z-standardizing and categorizing 11 items")
       fit <- fit_demo2_rsm(raw)
@@ -910,7 +996,7 @@ server <- function(input, output, session) {
       fit
     }), error = function(e) e)
     if (inherits(result, "error")) { demo2_fit(NULL); demo2_status_value(paste("Demo 2 could not run:", conditionMessage(result))); updateTabsetPanel(session, "main_tabs", selected = "Demo 2: Rasch forest"); return() }
-    demo2_fit(result); demo2_status_value(paste0("Completed: ", nrow(result$person), " scientists, ", nrow(result$items), " standardized 0–4 items, ", nrow(demo2_group_summary(result)), " profile groups; forest includes KID#", input$demo2_kid, ".")); updateTabsetPanel(session, "main_tabs", selected = "Demo 2: Rasch forest")
+    demo2_fit(result); demo2_status_value(paste0("Completed: ", nrow(result$person), " valid scientists (", attr(result$raw, "demo2_removed_empty_rows") %||% 0, " empty/non-numeric rows removed), ", nrow(result$items), " standardized 0–4 items, ", nrow(demo2_group_summary(result)), " profile groups; forest includes KID#", input$demo2_kid, ".")); updateTabsetPanel(session, "main_tabs", selected = "Demo 2: Rasch forest")
   }
   observeEvent(input$run_demo2, { demo2_path("data2.csv"); run_demo2_analysis("data2.csv") })
   observeEvent(input$demo2_csv, { req(input$demo2_csv$datapath); demo2_path(input$demo2_csv$datapath); demo2_status_value(paste("Uploaded", input$demo2_csv$name, "— click Run uploaded RSM forest.")) })
