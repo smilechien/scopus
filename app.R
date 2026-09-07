@@ -4,7 +4,7 @@
 `%||%` <- function(a, b) if (is.null(a) || !length(a)) b else a
 
 # MDPI journal metadata and FLCA explorer — reconstructed application shell.
-required <- c("shiny", "readr", "dplyr", "ggplot2", "tibble", "jsonlite", "curl")
+required <- c("shiny", "readr", "dplyr", "ggplot2", "tibble", "jsonlite", "curl", "plotly")
 missing <- required[!vapply(required, requireNamespace, logical(1), quietly = TRUE)]
 if (length(missing)) stop("Install required packages: ", paste(missing, collapse = ", "), call. = FALSE)
 suppressPackageStartupMessages({ library(shiny); library(readr); library(dplyr); library(ggplot2); library(tibble) })
@@ -634,6 +634,133 @@ cooccurrence <- function(term_sets, top_n = 20) {
   list(nodes = tibble(term = nodes, frequency = as.integer(singles)), edges = tibble(from = vapply(edge_split, `[`, "", 1), to = vapply(edge_split, `[`, "", 2), weight = as.integer(edge_tab)))
 }
 
+# Burt structural-hole metrics from the direct co-occurrence network.  These
+# deliberately use the unreduced edges shown in the Full network tab, rather
+# than any FLCA clustering or leader/follower reduction.
+structural_hole_metrics <- function(net) {
+  nd <- as.data.frame(net$nodes, stringsAsFactors = FALSE)
+  ed <- as.data.frame(net$edges, stringsAsFactors = FALSE)
+  if (nrow(nd) < 2 || !nrow(ed)) return(data.frame(Status = "At least one direct co-word link is required to estimate structural holes."))
+  names(nd)[seq_len(min(2, ncol(nd)))] <- c("Node", "Document_Count")[seq_len(min(2, ncol(nd)))]
+  nd$Node <- as.character(nd$Node); nd$Document_Count <- suppressWarnings(as.numeric(nd$Document_Count))
+  weight <- matrix(0, nrow(nd), nrow(nd), dimnames = list(nd$Node, nd$Node))
+  from <- match(as.character(ed$from), nd$Node); to <- match(as.character(ed$to), nd$Node); w <- suppressWarnings(as.numeric(ed$weight))
+  valid <- is.finite(from) & is.finite(to) & is.finite(w) & w > 0 & from != to
+  for (i in which(valid)) { weight[from[i], to[i]] <- weight[from[i], to[i]] + w[i]; weight[to[i], from[i]] <- weight[to[i], from[i]] + w[i] }
+  strength <- rowSums(weight); adjacency <- weight > 0; degree <- rowSums(adjacency)
+  p <- sweep(weight, 1, pmax(strength, 1), "/"); indirect <- p %*% p; diag(indirect) <- 0
+  constraint <- rowSums((p + indirect)^2)
+  effective_size <- vapply(seq_len(nrow(nd)), function(i) {
+    alters <- which(adjacency[i, ]); d <- length(alters)
+    if (!d) return(0)
+    alter_ties <- if (d < 2) 0 else sum(adjacency[alters, alters, drop = FALSE]) / 2
+    d - 2 * alter_ties / d
+  }, numeric(1))
+  isolated <- degree == 0
+  constraint[isolated] <- NA_real_; effective_size[isolated] <- NA_real_
+  score01 <- function(x, reverse = FALSE) {
+    out <- rep(NA_real_, length(x)); valid_x <- is.finite(x)
+    if (!any(valid_x)) return(out)
+    limits <- range(x[valid_x]); out[valid_x] <- if (diff(limits) == 0) .5 else (x[valid_x] - limits[1]) / diff(limits)
+    if (reverse) out[valid_x] <- 1 - out[valid_x]
+    out
+  }
+  # Translate 1 - constraint so the smallest openness is exactly zero.
+  openness_shifted <- rep(NA_real_, length(constraint)); connected <- is.finite(constraint)
+  if (any(connected)) openness_shifted[connected] <- max(constraint[connected]) - constraint[connected]
+  degree_score <- score01(degree)
+  low_constraint_score <- score01(openness_shifted)
+  effective_size_score <- score01(effective_size)
+  structural_hole_s <- degree_score + low_constraint_score + effective_size_score
+  structural_hole_coefficient <- structural_hole_s / (1 + structural_hole_s)
+  # AACa is calculated separately for each axis using the top-three ratio,
+  # then averaged across Degree, Openness, and Effective size.
+  axis_aac <- function(v) { v <- sort(as.numeric(v[is.finite(v) & v > 0]), decreasing = TRUE); if (length(v) < 3 || v[2] == 0 || v[3] == 0) return(NA_real_); r <- (v[1] / v[2]) / (v[2] / v[3]); r / (1 + r) }
+  degree_aac <- axis_aac(degree); openness_aac <- axis_aac(openness_shifted); effective_size_aac <- axis_aac(effective_size)
+  aaca <- mean(c(degree_aac, openness_aac, effective_size_aac), na.rm = TRUE); if (!is.finite(aaca)) aaca <- NA_real_
+  out <- data.frame(Node = nd$Node, Document_Count = nd$Document_Count, Coword_Strength = strength, Degree = degree, Burt_Constraint = constraint, Openness_Shifted = openness_shifted, Effective_Size = effective_size, Degree_Score = degree_score, Openness_Score = low_constraint_score, Effective_Size_Score = effective_size_score, Structural_Hole_S = structural_hole_s, SH_Coefficient = structural_hole_coefficient, Degree_AAC = degree_aac, Openness_AAC = openness_aac, Effective_Size_AAC = effective_size_aac, AACa = aaca, Interpretation = ifelse(isolated, "Isolated: not estimable", "Connected"), stringsAsFactors = FALSE)
+  out[order(is.na(out$SH_Coefficient), -out$SH_Coefficient, out$Burt_Constraint, -out$Effective_Size, out$Node), , drop = FALSE]
+}
+
+structural_hole_display_nodes <- function(nodes, label = "") {
+  nodes <- as.character(nodes)
+  if (grepl("region", label, ignore.case = TRUE)) nodes <- gsub("^(United States|China)\\s*[:：-]\\s*", "", nodes, ignore.case = TRUE)
+  nodes
+}
+
+structural_hole_3d_note <- function(net, label = "", single_author_n = NA_integer_) {
+  d <- structural_hole_metrics(net)
+  if ("Status" %in% names(d)) return(tags$div(class = "well", d$Status[1]))
+  d <- d[is.finite(d$SH_Coefficient), , drop = FALSE]
+  if (!nrow(d)) return(NULL)
+  dominant <- d[which.max(d$SH_Coefficient), , drop = FALSE]
+  name <- structural_hole_display_nodes(dominant$Node, label)
+  tags$div(class = "well", style = "margin-top:8px;",
+    tags$b(paste(label, "3D structural-hole interpretation")), tags$br(),
+    tags$span(style = "color:#D62828; font-weight:700;", sprintf("AACa = %.2f", dominant$AACa[1])),
+    tags$span(" — mean of the three axis-level AAC values for this displayed network."), tags$br(),
+    tags$b("Dominant structural-hole node: "), name, tags$br(),
+    sprintf("Degree = %.0f; Burt constraint = %.3f; shifted openness = %.3f; Effective size = %.3f; S = %.3f; coefficient = %.3f.", dominant$Degree[1], dominant$Burt_Constraint[1], dominant$Openness_Shifted[1], dominant$Effective_Size[1], dominant$Structural_Hole_S[1], dominant$SH_Coefficient[1]),
+    tags$p(style = "margin:7px 0 0 0;", "For each axis, the three highest positive values are ordered as v1, v2, and v3; r = (v1/v2)/(v2/v3), and axis AAC = r/(1+r). AACa is the mean of the Degree, Openness, and Effective-size AAC values for the displayed network. Openness = max(Burt constraint) - individual Burt constraint (equivalently, shifted 1 - Burt constraint); its minimum is set to 0 before standardization. AACa summarizes relative concentration, not leadership, research quality, or causal impact."),
+    if (is.finite(single_author_n)) tags$p(style = "margin:7px 0 0 0; color:#D62828; font-weight:700;", sprintf("Single-author publications: %d. These articles have no co-author link and are not included in the author structural-hole analysis.", as.integer(single_author_n)))
+  )
+}
+draw_structural_hole_3d <- function(net, label = "") {
+  d <- structural_hole_metrics(net)
+  if ("Status" %in% names(d)) return(draw_message(d$Status[1]))
+  d <- d[is.finite(d$Degree) & is.finite(d$Burt_Constraint) & is.finite(d$Effective_Size) & is.finite(d$SH_Coefficient), , drop = FALSE]
+  if (nrow(d) < 2) return(draw_message("At least two connected nodes are needed for the 3D structural-hole view."))
+  scale01 <- function(x) { r <- range(x, na.rm = TRUE); if (!is.finite(diff(r)) || diff(r) == 0) rep(.5, length(x)) else (x - r[1]) / diff(r) }
+  x <- scale01(d$Degree); openness <- scale01(d$Openness_Shifted); y <- openness; z <- scale01(d$Effective_Size)
+  # Isometric projection: Degree moves right; Burt constraint moves back-right; Effective size moves upward.
+  project <- function(x, y, z) cbind(x + .55 * y, -.30 * x + .34 * y + z)
+  cube <- expand.grid(x = c(0, 1), y = c(0, 1), z = c(0, 1)); cube_xy <- project(cube$x, cube$y, cube$z)
+  pad <- .28; xr <- range(cube_xy[, 1]) + c(-pad, pad * 1.9); yr <- range(cube_xy[, 2]) + c(-pad, pad * 1.6)
+  old_par <- par(no.readonly = TRUE); on.exit(par(old_par), add = TRUE); par(mar = c(4.2, 3.5, 4.8, 7.5), xpd = NA)
+  plot(NA, xlim = xr, ylim = yr, axes = FALSE, xlab = "", ylab = "", asp = 1, main = paste(label, "structural-hole 3D view"), font.main = 2)
+  grid_col <- "#BFD7EE"; box_col <- "#6EA6D8"
+  grid_values <- seq(0, 1, by = .25)
+  # Complete dotted 3D box and coloured grid planes in standardized 0–1 units.
+  cube_edges <- rbind(c(0,0,0,1,0,0), c(0,0,0,0,1,0), c(0,0,0,0,0,1), c(1,0,0,1,1,0), c(1,0,0,1,0,1), c(0,1,0,1,1,0), c(0,1,0,0,1,1), c(0,0,1,1,0,1), c(0,0,1,0,1,1), c(1,1,0,1,1,1), c(1,0,1,1,1,1), c(0,1,1,1,1,1))
+  for (e in seq_len(nrow(cube_edges))) { a <- project(cube_edges[e,1], cube_edges[e,2], cube_edges[e,3]); b <- project(cube_edges[e,4], cube_edges[e,5], cube_edges[e,6]); segments(a[1], a[2], b[1], b[2], lty = 3, lwd = 1.2, col = box_col) }
+  for (g in grid_values) {
+    a <- project(0, g, 0); b <- project(1, g, 0); segments(a[1], a[2], b[1], b[2], lty = 3, col = grid_col)
+    a <- project(g, 0, 0); b <- project(g, 1, 0); segments(a[1], a[2], b[1], b[2], lty = 3, col = grid_col)
+    a <- project(0, g, 0); b <- project(0, g, 1); segments(a[1], a[2], b[1], b[2], lty = 3, col = grid_col)
+    a <- project(g, 1, 0); b <- project(g, 1, 1); segments(a[1], a[2], b[1], b[2], lty = 3, col = grid_col)
+    a <- project(0, 0, g); b <- project(0, 1, g); segments(a[1], a[2], b[1], b[2], lty = 3, col = grid_col)
+    a <- project(0, 1, g); b <- project(1, 1, g); segments(a[1], a[2], b[1], b[2], lty = 3, col = grid_col)
+  }
+  o <- project(0, 0, 0); ax <- project(1, 0, 0); ay <- project(0, 1, 0); az <- project(0, 0, 1)
+  segments(o[1], o[2], ax[1], ax[2], lwd = 2.4, col = "#34495E"); segments(o[1], o[2], ay[1], ay[2], lwd = 2.4, col = "#34495E"); segments(o[1], o[2], az[1], az[2], lwd = 2.4, col = "#34495E")
+  text(ax[1] + .03, ax[2] - .08, "Degree  →", adj = 0, font = 2, col = "#D62828")
+  text(ay[1] + .04, ay[2] + .05, "Openness", adj = 0, font = 2, col = "#D62828")
+  text(az[1] - .04, az[2] + .04, "Effective size", adj = 1, font = 2, col = "#D62828")
+  for (g in grid_values) {
+    px <- project(g, 0, 0); text(px[1], px[2] - .055, sprintf("%.2f", g), cex = .62, col = "#4B5563")
+    if (g > 0) { py <- project(0, g, 0); text(py[1] + .03, py[2] - .02, sprintf("%.2f", g), cex = .62, col = "#4B5563"); pz <- project(0, 0, g); text(pz[1] - .04, pz[2], sprintf("%.2f", g), adj = 1, cex = .62, col = "#4B5563") }
+  }
+  max_i <- which.max(d$AACa)
+  mtext(sprintf("AACa = %.2f", d$AACa[max_i]), side = 3, line = .85, col = "#D62828", cex = 1.35, font = 2)
+  ranks <- rank(-d$SH_Coefficient, ties.method = "first"); point_col <- grDevices::colorRampPalette(c("#E65100", "#1F4E9B"))(nrow(d))[ranks]
+  point_xy <- project(x, y, z); floor_xy <- project(x, y, 0); xz_xy <- project(x, 0, z)
+  for (i in seq_len(nrow(d))) {
+    segments(floor_xy[i, 1], floor_xy[i, 2], point_xy[i, 1], point_xy[i, 2], lty = 3, lwd = 1.25, col = grDevices::adjustcolor(point_col[i], .72))
+    segments(xz_xy[i, 1], xz_xy[i, 2], point_xy[i, 1], point_xy[i, 2], lty = 3, lwd = .9, col = grDevices::adjustcolor(point_col[i], .45))
+  }
+  cex <- 1 + 2.8 * sqrt(pmax(d$Coword_Strength, 0) / max(c(1, d$Coword_Strength), na.rm = TRUE))
+  points(point_xy[, 1], point_xy[, 2], pch = 21, bg = point_col, col = "grey15", cex = cex)
+  display_nodes <- structural_hole_display_nodes(d$Node, label)
+  # Kano-style callouts: place leading node labels outside the 3D box with leader lines.
+  keep_label <- which(ranks <= min(4, nrow(d)))
+  if (length(keep_label)) {
+    keep_label <- keep_label[order(point_xy[keep_label, 2])]
+    label_x <- pmin(point_xy[keep_label, 1] + .20, xr[2] - .12)
+    label_y <- seq(yr[1] + .18, yr[2] - .18, length.out = length(keep_label))
+    segments(point_xy[keep_label, 1], point_xy[keep_label, 2], label_x - .02, label_y, col = "#6B7280", lwd = .9)
+    text(label_x, label_y, labels = display_nodes[keep_label], pos = 4, offset = .10, cex = .76, font = 2)
+  }
+}
 frequency_entity_tab <- function(id, title) tabPanel(title,
   tags$h4("Visualisations"),
   tabsetPanel(id = paste0("visual_tabs_", id),
@@ -645,7 +772,15 @@ flca_entity_tab <- function(id, title, extra_visual_tabs = list()) tabPanel(titl
   tags$h4("Visualisations"),
   do.call(tabsetPanel, c(list(id = paste0("visual_tabs_", id),
     tabPanel("Top-20 node counts", tableOutput(paste0(id, "_nodes"))),
-    tabPanel("Full network", plotOutput(paste0(id, "_full"), height = "650px")),
+    tabPanel("Full network",
+      plotOutput(paste0(id, "_full"), height = "650px"),
+      tags$h4("Structural holes in the full direct co-word network"),
+      tags$p("Calculated from the direct co-word edges displayed above, before FLCA reduction. Structural-hole coefficient = S/(1+S), where S is the equal-weight sum of 0–1 normalized Degree, reversed Burt constraint (lower is better), and Effective size (higher is better)."),
+      tableOutput(paste0(id, "_structural_holes")),
+      tags$h4("3D structural-hole view"),
+      plotOutput(paste0(id, "_structural_holes_3d"), height = "560px"),
+      uiOutput(paste0(id, "_structural_holes_3d_note"))
+    ),
     tabPanel("Reduced network", plotOutput(paste0(id, "_reduced"), height = "650px")),
     tabPanel("Sankey plot", plotOutput(paste0(id, "_sankey"), height = "650px")),
     tabPanel("Chord plot", plotOutput(paste0(id, "_chord"), height = "650px")),
@@ -691,19 +826,19 @@ summary_reference_journal <- function(df) {
 
 draw_summary_report <- function(summary_df, n_articles = NA_integer_, dataset_h = NA_integer_) {
   if (!nrow(summary_df)) { plot.new(); text(.5,.5,"Collect metadata to create the summary report.",cex=1.2); return() }
-  domains <- unique(summary_df$Domain); old <- par(no.readonly=TRUE); on.exit(par(old),add=TRUE)
+  domains <- unique(summary_df$Domain); short_element <- function(value, max_chars = 22L) { value <- region_visual_label(value); if (nchar(value) > max_chars) paste0(substr(value, 1L, max_chars - 3L), "...") else value }; old <- par(no.readonly=TRUE); on.exit(par(old),add=TRUE)
   n_rows <- max(1L, ceiling(length(domains) / 2)); n_slots <- n_rows * 2L
   par(mfrow=c(n_rows,2),mar=c(.2,.2,.2,.2),oma=c(0,0,4,0),xpd=NA)
   for (domain in domains) {
     d <- summary_df[summary_df$Domain == domain,,drop=FALSE]; d <- d[order(d$Count,d$Citations,decreasing=TRUE),,drop=FALSE]
-    plot.new(); plot.window(xlim=c(0,1),ylim=c(0,1)); text(.5,.93,domain,col="red",font=3,cex=2.35)
-    text(.77,.93,"h",font=2,cex=1.75); text(.91,.93,"n",font=2,cex=1.75)
-    yy <- seq(.73,.22,length.out=max(1,nrow(d))); for(i in seq_len(nrow(d))){ text(.04,yy[i],substr(as.character(d$Element[i]),1,31),adj=0,font=2,cex=1.55); text(.77,yy[i],d$h[i],font=2,cex=1.5); text(.91,yy[i],d$Count[i],font=2,cex=1.5) }
-    text(.72,.07,paste0("AAC = ",ifelse(is.finite(d$AAC[1]),sprintf("%.2f",d$AAC[1]),"NA")),col="red",font=2,cex=1.55,adj=0)
+plot.new(); plot.window(xlim=c(0,1),ylim=c(0,1)); text(.40,.93,domain,col="red",font=2,cex=2.65)
+    text(.77,.93,"h",font=2,cex=2.00); text(.91,.93,"n",font=2,cex=2.00)
+    yy <- seq(.73,.22,length.out=max(1,nrow(d))); for(i in seq_len(nrow(d))){ label <- short_element(d$Element[i]); text(.04,yy[i],label,adj=0,font=2,cex=1.58); text(.77,yy[i],d$h[i],font=2,cex=1.78); text(.91,yy[i],d$Count[i],font=2,cex=1.78) }
+    text(.72,.07,paste0("AAC = ",ifelse(is.finite(d$AAC[1]),sprintf("%.2f",d$AAC[1]),"NA")),col="red",font=2,cex=1.82,adj=0)
   }
   if(length(domains)<n_slots) for(i in seq_len(n_slots-length(domains))) plot.new()
   title <- paste0("Summary Report (n=",ifelse(is.finite(n_articles),n_articles,"NA"),", h=",ifelse(is.finite(dataset_h),dataset_h,"NA"),")")
-  mtext(title,outer=TRUE,font=2,cex=2.85,line=1)
+  mtext(title,outer=TRUE,font=2,cex=3.20,line=1)
 }
 
 # PubMed author AAC trend. AAC uses the top three first/last-author counts.
@@ -713,50 +848,33 @@ pubmed_aac_value <- function(counts) {
   gamma <- v[1] * v[3] / v[2]^2
   gamma / (1 + gamma)
 }
-pubmed_first_last_authors <- function(xml_text) {
+pubmed_article_authors <- function(xml_text) {
   articles <- regmatches(xml_text, gregexpr("<PubmedArticle\\b[\\s\\S]*?</PubmedArticle>", xml_text, perl = TRUE))[[1]]
-  unlist(lapply(articles, function(article) {
+  lapply(articles, function(article) {
     blocks <- regmatches(article, gregexpr("<Author(?: [^>]*)?>[\\s\\S]*?</Author>", article, perl = TRUE))[[1]]
-    authors <- vapply(blocks, function(block) {
-      last <- sub(".*?<LastName>([^<]+)</LastName>.*", "\\1", block, perl = TRUE)
-      fore <- sub(".*?<ForeName>([^<]+)</ForeName>.*", "\\1", block, perl = TRUE)
-      if (identical(last, block)) return("")
-      if (identical(fore, block)) fore <- ""
-      trimws(paste(last, fore))
-    }, character(1))
-    authors <- authors[nzchar(authors)]
-    if (length(authors) == 1L) authors else if (length(authors) > 1L) unique(c(authors[1], authors[length(authors)])) else character()
-  }), use.names = FALSE)
-}
-pubmed_esearch <- function(query, retmax) {
-  url <- paste0("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&retmode=json&retmax=", as.integer(retmax), "&term=", curl::curl_escape(query))
-  body <- rawToChar(curl::curl_fetch_memory(url)$content)
-  out <- jsonlite::fromJSON(body)$esearchresult
-  list(count = suppressWarnings(as.integer(out$count)), ids = as.character(out$idlist %||% character()))
-}
-pubmed_efetch_xml <- function(ids) {
-  url <- paste0("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pubmed&rettype=xml&id=", paste(ids, collapse = ","))
-  rawToChar(curl::curl_fetch_memory(url)$content)
-}
-compute_pubmed_author_aac <- function(author, retmax = 200L) {
-  result_row <- function(status, query = NA_character_, hits = NA_integer_, fetched = 0L) tibble(Input_author = author, PubMed_query = query, PubMed_hits = hits, Fetched_records = fetched, Top1_author = NA_character_, Top1_n = NA_integer_, Top2_author = NA_character_, Top2_n = NA_integer_, Top3_author = NA_character_, Top3_n = NA_integer_, AAC = NA_real_, Status = status)
-  author <- trimws(as.character(author)); if (!nzchar(author)) return(result_row("Blank author name"))
-  query <- if (grepl("\\[Author\\]", author, ignore.case = TRUE)) author else paste0(author, "[Author]")
-  search <- tryCatch(pubmed_esearch(query, retmax), error = function(e) e)
-  if (inherits(search, "error")) return(result_row(paste("PubMed search failed:", conditionMessage(search)), query))
-  hits <- search$count; ids <- search$ids
-  if (!length(ids)) return(result_row("No PubMed records found", query, hits, 0L))
-  if (is.finite(hits) && hits > length(ids)) return(result_row(paste0("AAC skipped: ", hits, " hits exceed fetch limit ", retmax, ". Refine the author query or raise the limit."), query, hits, length(ids)))
-  Sys.sleep(.34); xml <- tryCatch(pubmed_efetch_xml(ids), error = function(e) e)
-  if (inherits(xml, "error")) return(result_row(paste("PubMed fetch failed:", conditionMessage(xml)), query, hits, length(ids)))
-  tab <- sort(table(pubmed_first_last_authors(xml)), decreasing = TRUE)
-  if (length(tab) < 3L) return(result_row("AAC needs at least three first/last authors", query, hits, length(ids)))
-  tibble(Input_author = author, PubMed_query = query, PubMed_hits = hits, Fetched_records = length(ids), Top1_author = names(tab)[1], Top1_n = as.integer(tab[1]), Top2_author = names(tab)[2], Top2_n = as.integer(tab[2]), Top3_author = names(tab)[3], Top3_n = as.integer(tab[3]), AAC = pubmed_aac_value(as.numeric(tab[1:3])), Status = "OK")
-}# Demo 2: generic group-comparison Rating Scale Model (RSM).
+    unique(Filter(nzchar, vapply(blocks, function(block) {
+      last <- sub(".*?<LastName>([^<]+)</LastName>.*", "\\1", block, perl=TRUE); fore <- sub(".*?<ForeName>([^<]+)</ForeName>.*", "\\1", block, perl=TRUE)
+      if (identical(last,block)) return(""); if(identical(fore,block)) fore <- ""; trimws(paste(last,fore)) }, character(1)))) }) }
+pubmed_first_last_authors <- function(xml_text) unlist(lapply(pubmed_article_authors(xml_text), function(x) if(length(x)==1) x else if(length(x)>1) unique(c(x[1],x[length(x)])) else character()), use.names=FALSE)
+pubmed_author_matches <- function(x,q) { z<-strsplit(tolower(gsub("[^a-z ]","",q))," +")[[1]];z<-z[nzchar(z)];vapply(strsplit(tolower(gsub("[^a-z ]","",x))," +"),function(y)length(y)>0&&y[1]==z[1]&&(length(z)==1||(length(y)>1&&substr(y[2],1,1)==substr(z[2],1,1))),logical(1)) }
+pubmed_burt_constraint <- function(xml_text, query_author) {
+  groups <- lapply(pubmed_article_authors(xml_text),function(x)unique(ifelse(pubmed_author_matches(x,query_author),query_author,x)));groups<-Filter(function(x)length(x)>1,groups);if(!length(groups))return(NA_real_)
+  terms<-table(unlist(groups)); keys<-unlist(lapply(groups,function(x)utils::combn(sort(x),2,FUN=function(z)paste(z,collapse="\r"))),use.names=FALSE);if(!length(keys))return(NA_real_);tab<-table(keys);pairs<-strsplit(names(tab),"\r",fixed=TRUE)
+  m<-structural_hole_metrics(list(nodes=tibble(term=names(terms),frequency=as.integer(terms)),edges=tibble(from=vapply(pairs,`[`,"",1),to=vapply(pairs,`[`,"",2),weight=as.integer(tab))));v<-if("Status"%in%names(m))NA_real_ else m$Burt_Constraint[match(query_author,m$Node)];if(length(v)&&is.finite(v))as.numeric(v) else NA_real_ }
+pubmed_esearch <- function(query, retmax) { url<-paste0("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&retmode=json&retmax=",as.integer(retmax),"&term=",curl::curl_escape(query));out<-jsonlite::fromJSON(rawToChar(curl::curl_fetch_memory(url)$content))$esearchresult;list(count=suppressWarnings(as.integer(out$count)),ids=as.character(out$idlist%||%character())) }
+pubmed_efetch_xml <- function(ids) rawToChar(curl::curl_fetch_memory(paste0("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pubmed&rettype=xml&id=",paste(ids,collapse=",")))$content)
+compute_pubmed_author_aac <- function(author,retmax=200L) {
+ row<-function(status,query=NA_character_,hits=NA_integer_,fetched=0L,constraint=NA_real_)tibble(Input_author=author,PubMed_query=query,PubMed_hits=hits,Fetched_records=fetched,Top1_author=NA_character_,Top1_n=NA_integer_,Top2_author=NA_character_,Top2_n=NA_integer_,Top3_author=NA_character_,Top3_n=NA_integer_,AAC=NA_real_,Burt_Constraint=constraint,One_minus_C_pct=NA_real_,Status=status)
+ author<-trimws(as.character(author));if(!nzchar(author))return(row("Blank author name"));author<-trimws(sub("\\s*\\[Author\\]\\s*$","",author,ignore.case=TRUE));q<-paste0(author,"[Author]");z<-tryCatch(pubmed_esearch(q,retmax),error=function(e)e);if(inherits(z,"error"))return(row(paste("PubMed search failed:",conditionMessage(z)),q));if(!length(z$ids))return(row("No PubMed records found",q,z$count));if(is.finite(z$count)&&z$count>length(z$ids))return(row(paste0("AAC/constraint skipped: ",z$count," hits exceed fetch limit ",retmax,"."),q,z$count,length(z$ids)));Sys.sleep(.34);xml<-tryCatch(pubmed_efetch_xml(z$ids),error=function(e)e);if(inherits(xml,"error"))return(row(paste("PubMed fetch failed:",conditionMessage(xml)),q,z$count,length(z$ids)));c<-pubmed_burt_constraint(xml,author);tab<-sort(table(pubmed_first_last_authors(xml)),decreasing=TRUE);if(length(tab)<3)return(row("AAC needs at least three first/last authors",q,z$count,length(z$ids),c));tibble(Input_author=author,PubMed_query=q,PubMed_hits=z$count,Fetched_records=length(z$ids),Top1_author=names(tab)[1],Top1_n=as.integer(tab[1]),Top2_author=names(tab)[2],Top2_n=as.integer(tab[2]),Top3_author=names(tab)[3],Top3_n=as.integer(tab[3]),AAC=pubmed_aac_value(as.numeric(tab[1:3])),Burt_Constraint=c,One_minus_C_pct=NA_real_,Status="OK") }
+# Demo 2: generic group-comparison Rating Scale Model (RSM).
 # CSV convention: first column = ID, final column = group; numeric middle columns = items.
 read_demo2_csv <- function(path) {
   x <- tryCatch(utils::read.csv(path, stringsAsFactors = FALSE, check.names = FALSE, na.strings = c("", "."), fileEncoding = "UTF-8-BOM"), error = function(e) NULL)
-  validate(need(!is.null(x) && ncol(x) >= 4, "Demo 2 CSV needs an ID column, at least two numeric items, and a final group column."))
+  validate(need(!is.null(x), "Demo 2 CSV could not be read."))
+  # A final comma in a CSV creates an unnamed all-empty column; it is not an item or group.
+  empty_columns <- vapply(x, function(column) all(is.na(column) | !nzchar(trimws(as.character(column)))), logical(1))
+  x <- x[, !empty_columns, drop = FALSE]
+  validate(need(ncol(x) >= 4, "Demo 2 CSV needs an ID column, at least two numeric items, and a final group column."))
   item_index <- 2:(ncol(x) - 1)
   values <- lapply(item_index, function(j) suppressWarnings(as.numeric(gsub(",", "", trimws(as.character(x[[j]])), fixed = TRUE))))
   observed_by_row <- rowSums(do.call(cbind, lapply(values, is.finite)))
@@ -805,8 +923,15 @@ fit_demo2_rsm <- function(raw, categories = 4L, iterations = 60L) {
 }
 demo2_group_summary <- function(fit) {
   country_labels <- c(usa = "United States (usa)", chn = "China (chn)", twn = "Taiwan (twn)", hkg = "Hong Kong (hkg)", gbr = "United Kingdom (gbr)", kor = "South Korea (kor)", jpn = "Japan (jpn)", can = "Canada (can)", aus = "Australia (aus)")
-  d <- fit$person |> mutate(Group = ifelse(is.na(Group) | !nzchar(trimws(Group)), "Missing group", trimws(as.character(Group))))
-  d |> group_by(Group) |> summarise(N = n(), Measure = mean(Measure, na.rm = TRUE), SD = stats::sd(Measure, na.rm = TRUE), SE = ifelse(is.finite(SD), SD / sqrt(N), mean(SE, na.rm = TRUE)), .groups = "drop") |> mutate(Display_group = dplyr::recode(tolower(Group), !!!country_labels, .default = Group), Label = paste0(Display_group, " (n=", N, ")"))
+  people <- fit$person |> mutate(Group = ifelse(is.na(Group) | !nzchar(trimws(Group)), "Missing group", trimws(as.character(Group))))
+  summary <- people |> group_by(Group) |> summarise(
+    N = dplyr::n(),
+    Group_SD = stats::sd(.data$Measure, na.rm = TRUE),
+    Group_Measure = mean(.data$Measure, na.rm = TRUE),
+    Model_SE = mean(.data$SE, na.rm = TRUE),
+    .groups = "drop"
+  )
+  summary |> transmute(Group, N, Measure = Group_Measure, SD = Group_SD, SE = ifelse(is.finite(Group_SD), Group_SD / sqrt(N), Model_SE), Display_group = dplyr::recode(tolower(Group), !!!country_labels, .default = Group), Label = paste0(Display_group, " (n=", N, ")"))
 }
 draw_demo2_group_forest <- function(fit, kid = 1L) {
   d <- demo2_group_summary(fit); persons <- fit$person; kid <- max(1L, min(nrow(persons), suppressWarnings(as.integer(kid[1])))); chosen <- persons[kid, , drop = FALSE]
@@ -816,8 +941,70 @@ draw_demo2_group_forest <- function(fit, kid = 1L) {
   par(mar = c(4.5, 16, 4.5, 6), xpd = NA); plot(NA, xlim = limits, ylim = c(.5, nrow(d) + .5), yaxt = "n", xlab = "Rasch Rating Scale Model measure (logits; bars = ±1 SE)", ylab = "", main = paste0("Profile-group comparison with KID#", kid), bty = "n")
   abline(v = 0, lty = 2, col = "grey55"); text(limits[1], y, labels = sub(" \\(n=([0-9]+)\\)$", " (\\1)", d$Label), pos = 2, offset = .55, cex = .80, font = ifelse(tolower(d$Group) == "usa", 2, 1), col = ifelse(tolower(d$Group) == "usa", "#143E7A", "black")); segments(d$Lower, y, d$Upper, y, lwd = 2, col = ifelse(tolower(d$Group) == "usa", "#143E7A", "#6B7280")); points(d$Measure, y, pch = ifelse(d$Selected, 18, 19), cex = ifelse(d$Selected, 1.5, 1.15), col = ifelse(d$Selected, "#D94801", ifelse(tolower(d$Group) == "usa", "#143E7A", "#149B52"))); text(limits[2], y, sprintf("%.2f [%.2f, %.2f]", d$Measure, d$Lower, d$Upper), pos = 2, offset = .45, cex = .8)
 }
+demo2_msd_reference_group <- function(d) {
+  eligible <- d |> filter(is.finite(Measure), is.finite(SD), SD > 0)
+  validate(need(nrow(eligible) > 0, "The SMD forest needs a reference group with at least two varying person measures."))
+  eligible$Group[which.min(abs(eligible$Measure - stats::median(d$Measure, na.rm = TRUE)))]
+}
+draw_demo2_ratio_forest <- function(fit, reference_group = NULL) {
+  d <- demo2_group_summary(fit) |> filter(is.finite(Measure), is.finite(SE)); default_ref <- demo2_msd_reference_group(d)
+  if (is.null(reference_group) || !nzchar(reference_group) || !reference_group %in% d$Group || !is.finite(d$SD[match(reference_group, d$Group)]) || d$SD[match(reference_group, d$Group)] <= 0) reference_group <- default_ref
+  ref <- d[d$Group == reference_group, , drop = FALSE][1, , drop = FALSE]
+  d$MSD <- (d$Measure - ref$Measure) / ref$SD; d$MSD_SE <- sqrt(d$SE^2 + ref$SE^2) / ref$SD; d$Lower <- d$MSD - stats::qnorm(.975) * d$MSD_SE; d$Upper <- d$MSD + stats::qnorm(.975) * d$MSD_SE
+  reference_index <- match(reference_group, d$Group); d$MSD[reference_index] <- d$Lower[reference_index] <- d$Upper[reference_index] <- 0
+  d <- d |> arrange(MSD); y <- rev(seq_len(nrow(d))); limits <- range(c(d$Lower, d$Upper, 0), na.rm = TRUE); padding <- max(.25, diff(limits) * .15); limits <- limits + c(-padding, padding)
+  labels <- sub(" \\(n=([0-9]+)\\)$", " (\\1)", d$Label)
+  par(mar = c(5.5, 16, 4.7, 8), xpd = NA); plot(NA, xlim = limits, ylim = c(.5, nrow(d) + .5), yaxt = "n", xlab = "Standardized mean difference (reference-group SD units; 95% CI)", ylab = "", main = "Group SMD forest: compared with the median-measure reference group", bty = "n")
+  mtext(paste0("Reference: ", sub(" \\(n=([0-9]+)\\)$", " (\\1)", ref$Label), "; SMD = 0"), side = 3, line = .45, adj = 0, cex = .82); abline(v = 0, lty = 2, lwd = 1.5, col = "grey45")
+  text(limits[1], y, labels = labels, pos = 2, offset = .55, cex = .80, font = ifelse(d$Group == reference_group, 2, 1), col = ifelse(d$Group == reference_group, "#143E7A", "black"))
+  nonref <- d$Group != reference_group; if (any(nonref)) segments(d$Lower[nonref], y[nonref], d$Upper[nonref], y[nonref], lwd = 2.2, col = "#143E7A")
+  points(d$MSD, y, pch = ifelse(d$Group == reference_group, 15, 19), cex = ifelse(d$Group == reference_group, 1.25, 1.1), col = ifelse(d$Group == reference_group, "#149B52", "#D94801")); text(limits[2], y, sprintf("%.2f [%.2f, %.2f]", d$MSD, d$Lower, d$Upper), pos = 2, offset = .4, cex = .76)
+  invisible(reference_group)
+}
+draw_demo2_item_forest <- function(fit) {
+  d <- fit$items |> filter(is.finite(Difficulty), is.finite(SE)) |> arrange(Difficulty)
+  validate(need(nrow(d) > 0, "No finite RSM item difficulties are available."))
+  d$Lower <- d$Difficulty - d$SE
+  d$Upper <- d$Difficulty + d$SE
+  y <- rev(seq_len(nrow(d)))
+  limits <- range(c(d$Lower, d$Upper, 0), na.rm = TRUE)
+  padding <- max(.25, diff(limits) * .15)
+  limits <- limits + c(-padding, padding)
+  par(mar = c(4.8, 16, 4.7, 8), xpd = NA)
+  plot(NA, xlim = limits, ylim = c(.5, nrow(d) + .5), yaxt = "n",
+       xlab = "RSM item difficulty, delta (logits; bars = +/-1 SE)", ylab = "",
+       main = "RSM item-difficulty forest plot", bty = "n")
+  abline(v = 0, lty = 2, lwd = 1.5, col = "grey45")
+  text(limits[1], y, labels = d$Item, pos = 2, offset = .55, cex = .90, font = 2)
+  segments(d$Lower, y, d$Upper, y, lwd = 2.2, col = "#6B7280")
+  points(d$Difficulty, y, pch = 19, cex = 1.15, col = "#7E22CE")
+  text(limits[2], y, sprintf("%.2f [%.2f, %.2f]", d$Difficulty, d$Lower, d$Upper),
+       pos = 2, offset = .4, cex = .80)
+}
+demo2_measure_paste_text <- function(fit, kid = 1L) {
+  d <- demo2_group_summary(fit); persons <- fit$person; kid <- max(1L, min(nrow(persons), suppressWarnings(as.integer(kid[1])))); chosen <- persons[kid, , drop = FALSE]
+  d <- bind_rows(d, tibble(Group = as.character(chosen$Group), N = 1L, Measure = chosen$Measure, SD = NA_real_, SE = chosen$SE, Display_group = as.character(chosen$Group), Label = paste0("KID#", kid, ": ", chosen$Person)))
+  d$Lower_1SE <- d$Measure - d$SE; d$Upper_1SE <- d$Measure + d$SE; clean <- gsub("[,\r\n]+", " ", d$Label)
+  paste(vapply(seq_len(nrow(d)), function(i) paste(clean[i], sprintf("%.4f", d$Measure[i]), sprintf("%.4f", d$SE[i]), sprintf("%.4f", d$Lower_1SE[i]), sprintf("%.4f", d$Upper_1SE[i]), as.integer(d$N[i]), sep = ","), character(1)), collapse = "\n")
+}
+demo2_smd_frame <- function(fit, reference_group = NULL) {
+  d <- demo2_group_summary(fit) |> filter(is.finite(Measure), is.finite(SE)); default_ref <- demo2_msd_reference_group(d)
+  if (is.null(reference_group) || !nzchar(reference_group) || !reference_group %in% d$Group || !is.finite(d$SD[match(reference_group, d$Group)]) || d$SD[match(reference_group, d$Group)] <= 0) reference_group <- default_ref
+  ref_index <- match(reference_group, d$Group); ref <- d[ref_index, , drop = FALSE]
+  d$SMD <- (d$Measure - ref$Measure) / ref$SD; d$SMD_SE <- sqrt(d$SE^2 + ref$SE^2) / ref$SD; d$CI_lower <- d$SMD - stats::qnorm(.975) * d$SMD_SE; d$CI_upper <- d$SMD + stats::qnorm(.975) * d$SMD_SE
+  d$SMD[ref_index] <- d$CI_lower[ref_index] <- d$CI_upper[ref_index] <- 0
+  list(data = d, reference_index = ref_index)
+}
+demo2_smd_paste_text <- function(fit, reference_group = NULL) {
+  obj <- demo2_smd_frame(fit, reference_group); d <- obj$data; ref_index <- obj$reference_index; compare <- seq_len(nrow(d)) != ref_index & is.finite(d$SMD) & is.finite(d$SMD_SE) & d$SMD_SE > 0
+  validate(need(any(compare), "PasteTO requires at least one non-reference SMD with a finite confidence interval."))
+  clean <- gsub("[,\r\n]+", " ", d$Label); precision <- 1 / d$SMD_SE[compare]^2; weight <- 100 * precision / sum(precision)
+  rows <- data.frame(Study = c("Reference group", clean[compare]), Effect = c(0, d$SMD[compare]), SE = c(max(d$SMD_SE[compare]), d$SMD_SE[compare]), CI_lower = c(0, d$CI_lower[compare]), CI_upper = c(0, d$CI_upper[compare]), n = c(d$N[ref_index], d$N[compare]), Z = c(0, d$SMD[compare] / d$SMD_SE[compare]), p = c(1, 2 * stats::pnorm(-abs(d$SMD[compare] / d$SMD_SE[compare]))), W = c(0, weight), stringsAsFactors = FALSE)
+  if (sum(compare) > 1) { overall_se <- sqrt(1 / sum(precision)); overall <- sum(precision * d$SMD[compare]) / sum(precision); rows <- rbind(rows, data.frame(Study="Overall", Effect=overall, SE=overall_se, CI_lower=overall-stats::qnorm(.975)*overall_se, CI_upper=overall+stats::qnorm(.975)*overall_se, n=sum(d$N[compare]), Z=overall/overall_se, p=2*stats::pnorm(-abs(overall/overall_se)), W=100)) }
+  fmt <- function(x) formatC(as.numeric(x), format="f", digits=2); paste(vapply(seq_len(nrow(rows)), function(i) paste(c(rows$Study[i], fmt(rows[i,2:5]), as.integer(rows$n[i]), fmt(rows[i,7:9])), collapse=","), character(1)), collapse="\n")
+}
 ui <- fluidPage(
-  titlePanel("Scopus Metadata via FLCAr based on FA/CA authors"),
+  titlePanel("Scopus Metadata via FLCA based on FA/CA authors: Structural-hole analysis"),
   tags$head(tags$style(HTML(".flca-entity-heading { font-weight: 700; color: #1f4e79; margin-top: 14px; } .sidebar-section-title { color: #c9302c; font-size: 18px; font-weight: 700; border-bottom: 2px solid #c9302c; margin: 8px 0 10px; padding-bottom: 4px; } .tab-content { overflow-x: auto; } .nav-tabs > li.active > a, .nav-tabs > li.active > a:hover, .nav-tabs > li.active > a:focus, .nav-pills > li.active > a, .nav-pills > li.active > a:hover, .nav-pills > li.active > a:focus { color: #fff !important; background-color: #c9302c !important; border-color: #a52824 !important; font-weight: 700; }"))),
   sidebarLayout(
     sidebarPanel(width = 3,
@@ -830,7 +1017,8 @@ ui <- fluidPage(
       helpText("Scopus columns such as Author full names, Author Keywords, Affiliations, Year, Source title, and Cited by are mapped automatically."),
       tags$hr(),
       tags$h4("A. FLCA Process"),
-      actionButton("flca", "Build co-occurrence", class = "btn-warning btn-block"),
+      actionButton("flca", "Run FLCA Process", class = "btn-warning btn-block"),
+      tags$div(style = "font-weight:600; color:#8a3b00; margin-top:6px;", textOutput("flca_progress")),
       tags$hr(),
       tags$h4("D. References: journal and 1st-author co-word analysis"),
       actionButton("references", "Build cited-reference analysis", class = "btn-info btn-block"),
@@ -845,17 +1033,17 @@ ui <- fluidPage(
       fluidRow(column(7, actionButton("extract_article_content", "Extract keywords", class = "btn-success btn-block")), column(5, actionButton("clear_article_content", "Clear content", class = "btn-default btn-block"))),
       sliderInput("graphical_phrase_min", "Minimum keyphrase occurrences", min = 1, max = 10, value = 2, step = 1),
       tags$hr(), tags$div(class = "sidebar-section-title", "2. Forest plot"), tags$h4("Demo 2: Rasch group forest"),
-      helpText("Top-2% scientists: first column = name, the 11 numeric middle columns = items, and final profile column = group. Each item is Z-standardized then categorized 0–4."),
+      helpText("Top-2% scientists: first column = name, the 10 numeric middle columns = items, and final profile column = group. Each item is Z-standardized then categorized 0–4."),
       downloadButton("download_demo2", "Download data2.csv", class = "btn-default btn-block"),
       actionButton("run_demo2", "Run Demo 2 RSM forest", class = "btn-success btn-block"),
       numericInput("demo2_kid", "Selected KID# for forest comparison", value = 1, min = 1, step = 1),
       fileInput("demo2_csv", "Or upload a group-comparison CSV", accept = c("text/csv", ".csv"), buttonLabel = "Browse..."),
       actionButton("run_demo2_upload", "Run uploaded RSM forest", class = "btn-primary btn-block"),
       tags$hr(), tags$div(class = "sidebar-section-title", "3. AAC via PubMed"), tags$h4("PubMed author AAC trend"),
-      textAreaInput("pubmed_aac_authors", "Authors (one name per line)", placeholder = "Smith J\nWang Y\nChen L", rows = 7),
+      textAreaInput("pubmed_aac_authors", "Authors (one name per line; first 100 used)", placeholder = "Smith J\nWang Y\nChen L", rows = 7),
       numericInput("pubmed_aac_retmax", "Maximum PubMed records per author", value = 200, min = 3, max = 1000, step = 50),
       actionButton("run_pubmed_aac", "Search PubMed and compute AAC", class = "btn-danger btn-block"),
-      helpText("AAC is calculated only when all matching PubMed records are fetched.")
+      helpText("Each pasted line is searched as a PubMed [Author] query. Only the first 100 non-empty lines are used; AAC is calculated only when all matching records are fetched.")
     ),
     mainPanel(width = 9,
       tabsetPanel(id = "main_tabs",
@@ -888,6 +1076,47 @@ ui <- fluidPage(
             flca_entity_tab("cited_references", "Reference first authors & journals")
           )
         ),
+        tabPanel("Structural-hole",
+          h3("Structural-hole analysis"),
+          p("Choose a metadata entity to inspect its full direct co-occurrence network and the corresponding 3D structural-hole view."),
+          selectInput("structural_hole_entity", "Entity", choices = c(
+            "FA/CA authors" = "authors",
+            "FA/CA countries" = "countries",
+            "FA/CA regions" = "regions",
+            "FA/CA institutes" = "institutes",
+            "FA/CA departments" = "departments",
+            "Author Keywords" = "keywords",
+            "Index Keywords" = "index_keywords",
+            "Reference first authors & journals" = "cited_references"
+          )),
+          h4("Full direct co-occurrence network"),
+          plotOutput("structural_hole_full_network", height = "820px"),
+          h4("3D structural-hole view"),
+          plotOutput("structural_hole_3d", height = "820px"),
+          uiOutput("structural_hole_3d_note"),
+          h4("Structural-hole metrics"),
+          tableOutput("structural_hole_table")
+        ),
+        tabPanel("3D-keyword",
+          h3("Interactive 3D metadata-keyword dashboard"),
+          p("Select one to three metadata fields. Author Keywords and Index Keywords are included; terms are merged within each article before their maturity, influence, and recency are calculated."),
+          selectizeInput("keyword_3d_entities", "Metadata fields (up to three)",
+            choices = c(
+              "Author Keywords" = "Author_Keywords",
+              "Index Keywords" = "Index_Keywords",
+              "FA/CA authors" = "FA_CA_Authors",
+              "FA/CA countries" = "FA_CA_Countries",
+              "FA/CA institutes" = "FA_CA_Institutes",
+              "FA/CA departments" = "FA_CA_Departments",
+              "Journals" = "Journal"
+            ),
+            selected = c("Author_Keywords", "Index_Keywords"), multiple = TRUE,
+            options = list(maxItems = 3, placeholder = "Choose metadata fields")),
+          plotly::plotlyOutput("keyword_3d_plot", height = "820px"),
+          tags$p("Maturity = article frequency; influence = total direct co-occurrence strength; recency = correlation between time order and the latest four annual article counts. Point colour and height encode recency."),
+          h4("3D-keyword values"),
+          tableOutput("keyword_3d_table")
+        ),
         tabPanel("Reference journal trends",
           h3("Referenced journals by year"),
           p("Counts are extracted from the References fields in the collected article records."),
@@ -912,17 +1141,48 @@ ui <- fluidPage(
         ),
         tabPanel("Demo 2: Rasch forest",
           h3("Group-comparison Rasch Rating Scale Model forest plot"),
-          p("For the top-2% scientist Demo 2, the 11 numeric indicators are Z-standardized separately and converted to 0–4 categories before RSM estimation. The final profile column defines comparison groups."),
+          p("For the top-2% scientist Demo 2, the 10 numeric indicators are Z-standardized separately and converted to 0–4 categories before RSM estimation. The final profile column defines comparison groups."),
           textOutput("demo2_status"), br(),
-          plotOutput("demo2_group_forest", width = "100%", height = "1300px"),
+plotOutput("demo2_group_forest", width = "100%", height = "auto"),
+          tags$div(class = "well", tags$b("Original Rasch-measure forest — SE interpretation: "), "Each point is a group mean Rasch measure (or the selected KID# measure). Its horizontal bar is Measure ± 1 model-based standard error (SE), which describes the precision of that estimated latent measure. It is not a 95% confidence interval and it remains on the Rasch logit scale."),
+          h4("PasteTO: original Rasch-measure forest"), uiOutput("demo2_measure_paste_ui"),
+          tags$hr(), h4("Standardized mean difference (SMD) forest"),
+          p("Groups are expressed as mean standardized deviations from the default median-measure reference group."),
+          uiOutput("demo2_msd_reference_ui"),
+          plotOutput("demo2_ratio_forest", width = "100%", height = "auto"),
+          tags$div(class = "well", tags$b("SMD forest — 95% CI interpretation: "), "Each point is the difference between a group mean Rasch measure and the selected reference-group mean, divided by the reference-group SD. The dashed line at SMD = 0 denotes the reference group. Horizontal bars are 95% confidence intervals: SMD ± 1.96 × sqrt(SE_group² + SE_reference²) / SD_reference. These intervals assess uncertainty in a standardized between-group difference, not precision of the original Rasch measure."),
+          h4("PasteTO: SMD forest"), uiOutput("demo2_smd_paste_ui"),
+          tags$hr(), h4("RSM item-difficulty forest"),
+          plotOutput("demo2_item_forest", width = "100%", height = "auto"),
+          tags$div(class = "well", tags$b("Item delta interpretation: "), "Each point is an RSM item difficulty (delta); the dashed line at 0 is the model-centering constraint. Positive deltas indicate relatively more difficult items and negative deltas relatively easier items. Horizontal bars show +/-1 SE, which describes estimation precision rather than a 95% confidence interval."),
           h4("Group estimates"), tableOutput("demo2_group_table"),
           h4("RSM item estimates"), tableOutput("demo2_item_table")
         ),
-        tabPanel("PubMed AAC trend",
+        tabPanel("PubMed AAC trend", value = "pubmed_aac_trend",
           h3("PubMed author AAC trend"),
           textOutput("pubmed_aac_status"), br(),
           plotOutput("pubmed_aac_trend", height = "550px"),
+          h4("AAC and (1-C)% trend"),
+          plotOutput("pubmed_aac_sh_trend", height = "500px"),
           h4("PubMed author AAC results"), tableOutput("pubmed_aac_table")
+        ),
+        tabPanel("PasteTO",
+          h3("PasteTO forest-plot code"),
+          p("Copy either code block below. The SMD block follows the reference-app format: Study, Effect, SE, CI_lower, CI_upper, n, Z, p, W."),
+          h4("Original Rasch-measure forest"), uiOutput("demo2_measure_paste_tab_ui"),
+          h4("SMD forest"), uiOutput("demo2_smd_paste_tab_ui")
+        ),        tabPanel("分析方法（中文）",
+          h3("ScopusCluster 的分析方法與數理內容"),
+          tags$p("本研究依序分析：(1) Forest plot 區塊、(2) AAC via PubMed 區塊，以及 (3) Bibliometrics 區塊。"),
+          tags$h4("(1) Forest plot：Rasch Rating Scale Model（RSM）"),
+          tags$p("資料格式為第一欄個案姓名（KID）、中間 10 欄數值指標，以及最後一欄群組（profile）。系統先將第 j 個指標 x_ij 標準化為 z_ij = (x_ij − x̄_j) / s_j；再依該指標的最小與最大 Z 分數做線性轉換，q_ij = round[4 × (z_ij − min(z_j)) / (max(z_j) − min(z_j))]，並限制為 0–4。空白與「.」視為遺漏值，不納入該題計算。"),
+          tags$p("RSM 以個人能力／表現量 θ_i、項目難度 β_j 與共同門檻 τ_k 建模。第 i 位個案在項目 j 回答類別 k 的機率為 P(X_ij=k) = exp{k(θ_i−β_j)−Σ_{h=0}^{k}τ_h} / Σ_{r=0}^{4} exp{r(θ_i−β_j)−Σ_{h=0}^{r}τ_h}。程式利用殘差與 Fisher information 反覆更新 θ、β 與門檻；群組 Measure 為組內 θ 的平均，SE 為其標準誤。Forest plot 顯示各群組的 Measure ± 1 SE，並以紅色菱形對照指定 KID# 的個人 Measure ± 1 SE。"),
+          tags$h4("(2) AAC via PubMed：作者主導性與趨勢"),
+          tags$p("研究者每行輸入一位作者，系統以「作者姓名[Author]」檢索 PubMed；針對每篇擷取的文獻保留第一與最後作者，統計其出現次數並排序。若前三名頻數為 c_1、c_2、c_3（c_1 ≥ c_2 ≥ c_3 > 0），則相對優勢比 γ = (c_1/c_2)/(c_2/c_3) = c_1c_3/c_2²，AAC = γ/(1+γ)，範圍介於 0 與 1。AAC 越高，代表首位優勢相對於後續名次下降的程度越明顯。"),
+          tags$p("為避免不完整檢索扭曲排名，只有 PubMed 命中數不超過實際擷取筆數時才計算 AAC；超過使用者設定擷取上限者會標示為 skipped。趨勢圖以輸入順序為 x 軸、AAC 為 y 軸，紅線連結各有效 AAC，藍色水平點線標示 AAC = 0.70；同時計算所有有效作者 AAC 的平均數與中位數。"),
+          tags$h4("(3) Bibliometrics：Scopus 正規化、共現與 FLCA"),
+          tags$p("Scopus CSV 上傳後，系統正規化作者全名、關鍵詞、機構、國家／地區、年份、期刊與被引次數等欄位，並建立第一作者（FA）與通訊作者（CA）對應欄位。每一篇文獻內的實體集合 S_p 形成共現網絡；任兩實體 a 與 b 的邊權重為 w_ab = Σ_p I(a∈S_p 且 b∈S_p)。節點次數則為 n_a = Σ_p I(a∈S_p)，因此同一實體於同篇文章只計一次。"),
+          tags$p("系統保留主要節點並以 FLCA 建立追隨者－領導者連結與群集；SS 為局部正規化連結／輪廓分數，用以描述節點在其群集內相對連結品質。Qw 與 Qu 分別為加權與未加權 modularity，用以評估群集內連結相對於隨機網絡的集中程度。摘要報表中的 AAC 亦以各領域排序前三名計數套用 γ = c_1c_3/c_2² 與 AAC = γ/(1+γ) 計算。國家、地區與地圖則按文章去重計數，若 FA 或 CA 欄位之一缺失，使用另一欄可用資訊補足。")
         ),
         tabPanel("ReadMe",
           h3("Scopus FLCA workflow"),
@@ -952,34 +1212,39 @@ server <- function(input, output, session) {
   keywords_done <- reactiveVal(FALSE)
   flca_ready <- reactiveVal(FALSE)
   flca_cache <- reactiveVal(list())
+  flca_progress_status <- reactiveVal("Ready to build the FLCA process.")
   references_ready <- reactiveVal(FALSE)
   keyword_results <- reactiveVal(tibble())
   article_references <- reactiveVal(parse_mdpi_references(default_scopus_references))
   graphical_abstract <- reactiveVal(extract_article_content_terms(default_article_content))
   selected_scopus_csv <- reactiveVal(NULL)
   pubmed_aac_results <- reactiveVal(NULL)
-  pubmed_aac_status_value <- reactiveVal("Paste one author name per line, then search PubMed.")
+  pubmed_aac_status_value <- reactiveVal("Paste author names one per line. Each line will be searched as a PubMed [Author] query; the first 100 names are used.")
   observeEvent(input$run_pubmed_aac, {
     author_text <- gsub("\r\n?", "\n", input$pubmed_aac_authors %||% "")
     authors <- trimws(strsplit(author_text, "\n", fixed = TRUE)[[1]])
     authors <- authors[nzchar(authors)]
-    if (!length(authors)) { pubmed_aac_status_value("Enter at least one author name."); updateTabsetPanel(session, "main_tabs", selected = "PubMed AAC trend"); return() }
-    if (length(authors) > 100L) { pubmed_aac_status_value("Search no more than 100 authors at a time."); updateTabsetPanel(session, "main_tabs", selected = "PubMed AAC trend"); return() }
-    pubmed_aac_status_value(paste0("Input contains ", length(authors), " non-empty author line(s). Searching PubMed...")); pubmed_aac_results(NULL)
+    if (!length(authors)) { pubmed_aac_status_value("Enter at least one author name."); updateTabsetPanel(session, "main_tabs", selected = "pubmed_aac_trend"); return() }
+
+    submitted_n <- length(authors)
+    authors <- head(authors, 100L)
+    truncation_note <- if (submitted_n > length(authors)) paste0(" First 100 of ", submitted_n, " non-empty names will be searched.") else ""
+    pubmed_aac_status_value(paste0("Searching ", length(authors), " author [Author] queries.", truncation_note)); pubmed_aac_results(NULL)
     results <- tryCatch(withProgress(message = "PubMed author AAC", value = 0, {
       out <- vector("list", length(authors))
       for (i in seq_along(authors)) { incProgress(1 / length(authors), detail = paste0(i, "/", length(authors), ": ", authors[i])); out[[i]] <- compute_pubmed_author_aac(authors[i], as.integer(input$pubmed_aac_retmax)); if (i < length(authors)) Sys.sleep(.34) }
       bind_rows(out)
     }), error = function(e) e)
-    if (inherits(results, "error")) { pubmed_aac_status_value(paste("PubMed AAC failed:", conditionMessage(results))); updateTabsetPanel(session, "main_tabs", selected = "PubMed AAC trend"); return() }
-    results$Sequence <- seq_len(nrow(results)); pubmed_aac_results(results)
+    if (inherits(results, "error")) { pubmed_aac_status_value(paste("PubMed AAC failed:", conditionMessage(results))); updateTabsetPanel(session, "main_tabs", selected = "pubmed_aac_trend"); return() }
+    results$Sequence <- seq_len(nrow(results)); ok <- is.finite(results$Burt_Constraint); if (any(ok)) results$One_minus_C_pct[ok] <- 100 * (1 - results$Burt_Constraint[ok]); pubmed_aac_results(results)
     valid <- results$AAC[is.finite(results$AAC)]
-    pubmed_aac_status_value(paste0("Completed ", nrow(results), " author searches; ", length(valid), " valid AAC estimates. Mean AAC = ", if(length(valid)) sprintf("%.3f", mean(valid)) else "NA", "; median AAC = ", if(length(valid)) sprintf("%.3f", median(valid)) else "NA", "."))
-    updateTabsetPanel(session, "main_tabs", selected = "PubMed AAC trend")
+    pubmed_aac_status_value(paste0("Completed ", nrow(results), " PubMed [Author] searches", if (submitted_n > nrow(results)) paste0(" (limited to first 100 of ", submitted_n, ")") else "", "; ", length(valid), " valid AAC estimates. Mean AAC = ", if(length(valid)) sprintf("%.3f", mean(valid)) else "NA", "; median AAC = ", if(length(valid)) sprintf("%.3f", median(valid)) else "NA", "."))
+    updateTabsetPanel(session, "main_tabs", selected = "pubmed_aac_trend")
   })
   output$pubmed_aac_status <- renderText(pubmed_aac_status_value())
   output$pubmed_aac_trend <- renderPlot({ d <- pubmed_aac_results(); req(!is.null(d)); valid <- d |> filter(is.finite(AAC)); validate(need(nrow(valid) > 0, "No valid AAC estimates. Check the result status and refine author queries.")); ggplot(valid, aes(x = Sequence, y = AAC)) + geom_hline(yintercept = .70, linetype = "dotted", linewidth = 1, color = "#1565C0") + geom_line(color = "red", linewidth = 1.15) + geom_point(color = "red", size = 2.8) + scale_x_continuous(breaks = pretty(valid$Sequence, n = min(10, nrow(valid)))) + coord_cartesian(ylim = c(0, 1)) + labs(title = "AAC for PubMed authors", subtitle = paste0("Mean = ", sprintf("%.3f", mean(valid$AAC)), "; median = ", sprintf("%.3f", median(valid$AAC)), "; blue dotted reference = 0.70"), x = "Sequential author number", y = "AAC") + theme_minimal(base_size = 14) })
-  output$pubmed_aac_table <- renderTable({ d <- pubmed_aac_results(); req(!is.null(d)); d |> select(Sequence, Input_author, PubMed_hits, Fetched_records, Top1_author, Top1_n, Top2_author, Top2_n, Top3_author, Top3_n, AAC, Status) }, digits = 3, striped = TRUE, bordered = TRUE)
+  output$pubmed_aac_sh_trend <- renderPlot({ d<-pubmed_aac_results();req(!is.null(d));v<-d|>filter(is.finite(AAC),is.finite(One_minus_C_pct));validate(need(nrow(v)>=2,"At least two authors with AAC and Burt constraint are required."));ct<-if(nrow(v)>=3)stats::cor.test(v$AAC,v$One_minus_C_pct)else NULL;hhi<-{ w<-v$One_minus_C_pct; total<-sum(w); if(is.finite(total)&&total>0) sum((100*w/total)^2) else NA_real_ };z<-rbind(data.frame(Sequence=v$Sequence,Metric="AAC",Value=v$AAC),data.frame(Sequence=v$Sequence,Metric="(1-C)%",Value=v$One_minus_C_pct/100));st<-if(is.null(ct))paste0("Pearson correlation requires at least 3 authors; HHI (1-C)% = ",if(is.finite(hhi))sprintf("%.1f",hhi)else"NA") else sprintf("AAC vs (1-C)%%: Pearson r = %.3f; t = %.3f; p = %.4g (n = %d); HHI (1-C)%% = %.1f",unname(ct$estimate),unname(ct$statistic),ct$p.value,nrow(v),hhi);ggplot(z,aes(Sequence,Value,colour=Metric,group=Metric))+geom_line(linewidth=1.15)+geom_point(size=2.8)+scale_colour_manual(values=c("AAC"="#D62828","(1-C)%"="#1565C0"))+scale_y_continuous(name="AAC",limits=c(0,1),sec.axis=sec_axis(~ . * 100,name="(1-C)%"))+labs(title="AAC and (1-C)% across searched PubMed authors",subtitle=st,x="Sequential searched-author number",colour=NULL)+theme_minimal(base_size=14)+theme(legend.position="bottom") })
+  output$pubmed_aac_table <- renderTable({ d<-pubmed_aac_results();req(!is.null(d));d|>select(Sequence,Input_author,PubMed_query,PubMed_hits,Fetched_records,Top1_author,Top1_n,Top2_author,Top2_n,Top3_author,Top3_n,AAC,Burt_Constraint,One_minus_C_pct,Status) },digits=3,striped=TRUE,bordered=TRUE)
   demo2_path <- reactiveVal(NULL)
   demo2_fit <- reactiveVal(NULL)
   demo2_status_value <- reactiveVal("Choose Run Demo 2 or select an upload, then click Run uploaded RSM forest.")
@@ -990,7 +1255,7 @@ server <- function(input, output, session) {
     result <- tryCatch(withProgress(message = "Running Demo 2 Rating Scale Model", value = 0, {
       incProgress(.15, detail = "Reading CSV and removing empty/non-numeric rows")
       raw <- read_demo2_csv(path)
-      incProgress(.45, detail = "Z-standardizing and categorizing 11 items")
+      incProgress(.45, detail = "Z-standardizing and categorizing 10 items")
       fit <- fit_demo2_rsm(raw)
       incProgress(.95, detail = "Building group forest with selected KID")
       fit
@@ -1002,7 +1267,16 @@ server <- function(input, output, session) {
   observeEvent(input$demo2_csv, { req(input$demo2_csv$datapath); demo2_path(input$demo2_csv$datapath); demo2_status_value(paste("Uploaded", input$demo2_csv$name, "— click Run uploaded RSM forest.")) })
   observeEvent(input$run_demo2_upload, { if (is.null(demo2_path())) { demo2_status_value("Choose a CSV first."); updateTabsetPanel(session, "main_tabs", selected = "Demo 2: Rasch forest") } else run_demo2_analysis(demo2_path()) })
   output$demo2_status <- renderText(demo2_status_value())
-  output$demo2_group_forest <- renderPlot({ req(demo2_fit()); draw_demo2_group_forest(demo2_fit(), input$demo2_kid) })
+  output$demo2_group_forest <- renderPlot({ req(demo2_fit()); draw_demo2_group_forest(demo2_fit(), input$demo2_kid) }, height = function() { if (is.null(demo2_fit())) 400 else max(360, 32 * (nrow(demo2_group_summary(demo2_fit())) + 1)) })
+  output$demo2_msd_reference_ui <- renderUI({ req(demo2_fit()); d <- demo2_group_summary(demo2_fit()); eligible <- d |> filter(is.finite(SD), SD > 0); if (!nrow(eligible)) return(helpText("No group has sufficient within-group variation for a MSD forest.")); default_ref <- demo2_msd_reference_group(d); selectInput("demo2_msd_reference", "SMD reference group", choices = stats::setNames(eligible$Group, sub(" \\(n=([0-9]+)\\)$", " (\\1)", eligible$Label)), selected = default_ref) })
+  output$demo2_ratio_forest <- renderPlot({ req(demo2_fit()); draw_demo2_ratio_forest(demo2_fit(), input$demo2_msd_reference) }, height = function() { if (is.null(demo2_fit())) 400 else max(360, 32 * nrow(demo2_group_summary(demo2_fit()))) })
+  output$demo2_item_forest <- renderPlot({ req(demo2_fit()); draw_demo2_item_forest(demo2_fit()) }, height = function() { if (is.null(demo2_fit())) 360 else max(360, 42 * nrow(demo2_fit()$items)) })
+  demo2_measure_paste_ui <- function(id) renderUI({ if (is.null(demo2_fit())) return(helpText("Run Demo 2 first.")); tagList(tags$p(tags$a("Open QSubgrouptest.asp to paste this code", href = "https://www.raschonline.com/kpiall/QSubgrouptest.asp", target = "_blank", rel = "noopener")), textAreaInput(id, "Copy PasteTO code", value = demo2_measure_paste_text(demo2_fit(), input$demo2_kid), rows = 12, width = "100%")) })
+  demo2_smd_paste_ui <- function(id) renderUI({ if (is.null(demo2_fit())) return(helpText("Run Demo 2 first.")); value <- tryCatch(demo2_smd_paste_text(demo2_fit(), input$demo2_msd_reference), error = function(e) conditionMessage(e)); tagList(tags$p(tags$a("Open QSubgrouptest.asp to paste this code", href = "https://www.raschonline.com/kpiall/QSubgrouptest.asp", target = "_blank", rel = "noopener")), textAreaInput(id, "Copy PasteTO code", value = value, rows = 18, width = "100%")) })
+  output$demo2_measure_paste_ui <- demo2_measure_paste_ui("demo2_measure_paste")
+  output$demo2_smd_paste_ui <- demo2_smd_paste_ui("demo2_smd_paste")
+  output$demo2_measure_paste_tab_ui <- demo2_measure_paste_ui("demo2_measure_paste_tab")
+  output$demo2_smd_paste_tab_ui <- demo2_smd_paste_ui("demo2_smd_paste_tab")
   output$demo2_group_table <- renderTable({ req(demo2_fit()); demo2_group_summary(demo2_fit()) |> arrange(desc(Measure)) }, digits = 3, striped = TRUE, bordered = TRUE)
   output$demo2_item_table <- renderTable({ req(demo2_fit()); demo2_fit()$items }, digits = 3, striped = TRUE, bordered = TRUE)
   observeEvent(session$clientData$url_search, {
@@ -1130,6 +1404,7 @@ observeEvent(input$extract_article_content, {
     req(nrow(data()))
     flca_ready(TRUE)
     flca_cache(list())
+    flca_progress_status("Initializing direct co-word networks...")
     tasks <- list(
       authors = list(label = "FA/CA authors", network = author_net),
       countries = list(label = "FA/CA countries", network = country_net),
@@ -1141,13 +1416,28 @@ observeEvent(input$extract_article_content, {
     )
     if (isTRUE(references_ready())) tasks$cited_references <- list(label = "Cited-reference authors and journals", network = cited_reference_net)
     withProgress(message = "Building FLCA results", value = 0, {
+      incProgress(.05, detail = "Initializing direct co-word networks")
       for (i in seq_along(tasks)) {
         task <- tasks[[i]]
+        flca_progress_status(paste("Running", task$label, "(", i, "of", length(tasks), ")"))
         incProgress(0, detail = paste("Running", task$label))
         flca_result_cached(names(tasks)[i], task$network())
-        incProgress(1 / length(tasks), detail = paste("Completed", task$label))
+        incProgress(.80 / length(tasks), detail = paste("Completed", task$label))
       }
+      # A distinct stage makes the post-FLCA scaling work visible rather than
+      # leaving the progress bar apparently stationary before visual output.
+      flca_progress_status("Scaling network metrics and structural-hole axes...")
+      incProgress(0, detail = "Scaling network metrics and structural-hole axes")
+      for (i in seq_along(tasks)) {
+        task <- tasks[[i]]
+        flca_progress_status(paste("Scaling", task$label, "(", i, "of", length(tasks), ")"))
+        structural_hole_metrics(task$network())
+        incProgress(.10 / length(tasks), detail = paste("Scaling", task$label))
+      }
+      flca_progress_status("Scaling complete: preparing standardized visualizations...")
+      incProgress(.05, detail = "Finalizing FLCA process")
     })
+    flca_progress_status(paste("Completed: FLCA results and scaling prepared for", length(tasks), "metadata domains."))
     updateTabsetPanel(session, "main_tabs", selected = "FLCA Process")
   }
   observeEvent(input$flca, build_flca_results())
@@ -1226,6 +1516,29 @@ observeEvent(input$extract_article_content, {
   corresponding_author_department_net <- reactive(entity_network(c("CA_Department")))
   keyword_net <- reactive(entity_network(c("Author_Keywords", "Keywords")))
   index_keyword_net <- reactive(entity_network(c("Index_Keywords")))
+  keyword_3d_columns <- reactive({
+    key <- input$keyword_3d_entities %||% c("Author_Keywords", "Index_Keywords")
+    map <- list(Author_Keywords=c("Author_Keywords", "Keywords"), Index_Keywords="Index_Keywords", FA_CA_Authors=c("FA_Author", "CA_Author"), FA_CA_Countries=c("FA_Country", "CA_Country"), FA_CA_Institutes=c("FA_Institute", "CA_Institute"), FA_CA_Departments=c("FA_Department", "CA_Department"), Journal="Journal")
+    unique(unlist(map[intersect(key, names(map))], use.names=FALSE))
+  })
+  keyword_3d_metrics <- reactive({
+    x <- data(); req(nrow(x)); cols <- intersect(keyword_3d_columns(), names(x)); if (!length(cols)) return(tibble())
+    sets <- lapply(seq_len(nrow(x)), function(i) unique(unlist(lapply(cols, function(col) unique_terms(x[[col]][i])), use.names=FALSE)))
+    net <- cooccurrence(sets, min(20L, input$top_n)); if (!nrow(net$nodes)) return(tibble())
+    d <- tibble(term=as.character(net$nodes$term), Maturity=as.numeric(net$nodes$frequency)); strength <- setNames(rep(0, nrow(d)), d$term)
+    if (nrow(net$edges)) for (i in seq_len(nrow(net$edges))) { w <- as.numeric(net$edges$weight[i]); strength[as.character(net$edges$from[i])] <- strength[as.character(net$edges$from[i])] + w; strength[as.character(net$edges$to[i])] <- strength[as.character(net$edges$to[i])] + w }
+    d$Influence <- unname(strength[d$term]); yrs <- if ("Publication_Date" %in% names(x)) extract_year(x$Publication_Date) else if ("Year" %in% names(x)) suppressWarnings(as.integer(x$Year)) else rep(NA_integer_, nrow(x)); all_years <- sort(unique(yrs[is.finite(yrs)]))
+    d$Recency <- vapply(d$term, function(term) { if (length(all_years)<2) return(0); annual <- vapply(all_years, function(y) sum(yrs==y & vapply(sets, function(z) term %in% z, logical(1)), na.rm=TRUE), numeric(1)); annual <- tail(annual, min(4L,length(annual))); if(length(annual)<2 || stats::sd(annual)==0) return(0); z <- suppressWarnings(stats::cor(seq_along(annual),annual)); ifelse(is.finite(z),z,0) }, numeric(1))
+    d |> arrange(desc(Maturity),desc(Influence),term) |> mutate(Rank=row_number())
+  })
+  output$keyword_3d_plot <- plotly::renderPlotly({
+    d <- keyword_3d_metrics(); if (!nrow(d)) return(plotly::plot_ly() |> plotly::layout(title=list(text="No dated metadata terms are available for this 3D-keyword selection.")))
+    x <- d$Maturity; y <- d$Influence; z <- d$Recency; rng <- function(v,lo=NULL,hi=NULL) { a<-min(v,na.rm=TRUE); b<-max(v,na.rm=TRUE); if(!is.null(lo))a<-min(a,lo); if(!is.null(hi))b<-max(b,hi); if(a==b)c(a-1,b+1) else c(a,b) }; xr<-rng(x); yr<-rng(y); zr<-rng(z,-1,1)
+    size <- if(diff(range(x))>0) 10+24*(x-min(x))/diff(range(x)) else rep(16,nrow(d)); hover <- paste0("<b>",htmltools::htmlEscape(d$term),"</b><br>Maturity (articles): ",x,"<br>Influence (co-word strength): ",y,"<br>Recency trend (r): ",round(z,3))
+    p <- plotly::plot_ly() |> plotly::add_trace(x=c(xr[1],xr[2],xr[2],xr[1]),y=c(yr[1],yr[1],yr[2],yr[2]),z=c(0,0,0,0),type="mesh3d",i=c(0,0),j=c(1,2),k=c(2,3),opacity=.13,color="lightblue",hoverinfo="skip",showlegend=FALSE) |> plotly::add_trace(x=c(xr[1],xr[1]),y=c(yr[1],yr[1]),z=zr,type="scatter3d",mode="lines",line=list(color="red",width=10),name="Recency axis",hoverinfo="skip") |> plotly::add_trace(x=x,y=y,z=z,type="scatter3d",mode="markers+text",text=d$Rank,textposition="top center",hovertext=hover,hoverinfo="text",marker=list(size=size,color=z,colorscale=list(c(0,"blue"),c(.5,"white"),c(1,"red")),cmin=-1,cmax=1,opacity=.88,line=list(color="black",width=1)),showlegend=FALSE)
+    plotly::layout(p,title=list(text="3D-keyword: maturity, influence, and recency"),scene=list(xaxis=list(title="Maturity = article frequency",range=xr),yaxis=list(title="Influence = co-occurrence strength",range=yr),zaxis=list(title="Recency = cor(1:n, latest 4 annual counts)",range=zr),aspectmode="cube",camera=list(eye=list(x=1.85,y=-2.35,z=1.25))),margin=list(l=0,r=30,b=0,t=55))
+  })
+  output$keyword_3d_table <- renderTable({ d<-keyword_3d_metrics(); if(!nrow(d)) return(data.frame(Status="No metadata terms are available for this selection.")); d[,c("Rank","term","Maturity","Influence","Recency")] }, digits=3, striped=TRUE, bordered=TRUE)
   country_net <- reactive(entity_pair_network(c("FA_Country", "CA_Country")))
   institute_net <- reactive(entity_pair_network(c("FA_Institute", "CA_Institute")))
   department_net <- reactive(entity_pair_network(c("FA_Department", "CA_Department")))
@@ -1250,6 +1563,40 @@ observeEvent(input$extract_article_content, {
   })
   reference_author_journal_net <- reactive({ x <- article_references(); if (!nrow(x)) return(list(nodes=tibble(), edges=tibble())); x$Author_Journal <- vapply(seq_len(nrow(x)), function(i) paste(c(unique_terms(x$Authors[i]), if (!empty_text(x$Journal[i])) paste0("Journal: ", x$Journal[i]) else character()), collapse="; "), character(1)); cooccurrence(article_term_sets(x, "Author_Journal"), min(20, input$top_n)) })
   graphical_abstract_net <- reactive({ z <- graphical_abstract(); blocked <- z$abbreviations %||% character(); final_sets <- lapply(z$sets, function(s) setdiff(s, blocked)); cooccurrence(final_sets, 20L) })
+  structural_hole_entities <- list(
+    authors = list(network = author_net, label = "FA/CA authors", region_style = FALSE),
+    countries = list(network = country_net, label = "FA/CA countries", region_style = FALSE),
+    regions = list(network = region_net, label = "FA/CA regions", region_style = TRUE),
+    institutes = list(network = institute_net, label = "FA/CA institutes", region_style = FALSE),
+    departments = list(network = department_net, label = "FA/CA departments", region_style = FALSE),
+    keywords = list(network = keyword_net, label = "Author Keywords", region_style = FALSE),
+    index_keywords = list(network = index_keyword_net, label = "Index Keywords", region_style = FALSE),
+    cited_references = list(network = cited_reference_net, label = "Reference first authors & journals", region_style = FALSE)
+  )
+  selected_structural_hole_entity <- reactive({ structural_hole_entities[[input$structural_hole_entity %||% "authors"]] })
+  output$structural_hole_full_network <- renderPlot({
+    selected <- selected_structural_hole_entity()
+    draw_network(selected$network(), paste(selected$label, "full co-occurrence network"), region_style = selected$region_style)
+  })
+  output$structural_hole_3d <- renderPlot({
+    selected <- selected_structural_hole_entity()
+    draw_structural_hole_3d(selected$network(), selected$label)
+  })
+  output$structural_hole_table <- renderTable({
+    selected <- selected_structural_hole_entity()
+    metrics <- structural_hole_metrics(selected$network())
+    if ("Status" %in% names(metrics)) return(metrics)
+    head(metrics, 20)
+  }, digits = 3, striped = TRUE, bordered = TRUE)
+  output$structural_hole_3d_note <- renderUI({
+    selected <- selected_structural_hole_entity()
+    single_author_n <- NA_integer_
+    if (identical(input$structural_hole_entity, "authors")) {
+      x <- data()
+      if ("Authors" %in% names(x)) single_author_n <- sum(vapply(x$Authors, function(a) length(unique_terms(a)) == 1L, logical(1)), na.rm = TRUE)
+    }
+    structural_hole_3d_note(selected$network(), selected$label, single_author_n)
+  })
   fa_ca_region_counts <- reactive({
     x <- data(); columns <- intersect(c("FA_Region", "CA_Region"), names(x))
     if (!nrow(x) || !length(columns)) return(tibble(Country = character(), Region = character(), Count = integer()))
@@ -1342,7 +1689,8 @@ observeEvent(input$extract_article_content, {
       labs(title = "FA/CA countries by article count", subtitle = "Log colour scale; each country is counted once per article across FA_Country and CA_Country") +
       theme_void(base_size = 14) + theme(plot.title = element_text(face = "bold", hjust = .5), plot.subtitle = element_text(hjust = .5), legend.position = "right")
   })
-  output$flca_status <- renderText({ if (!flca_ready()) "Click C. Build FLCA process after collecting metadata and extracting keywords." else paste("FLCA co-occurrence prepared for", nrow(data()), "articles.") })
+  output$flca_progress <- renderText(flca_progress_status())
+  output$flca_status <- renderText({ if (!flca_ready()) "Click C. Build FLCA process after collecting metadata and extracting keywords." else paste("FLCA co-occurrence prepared for", nrow(data()), "articles.", flca_progress_status()) })
   fallback_flca <- function(net) {
     nd <- as.data.frame(net$nodes, stringsAsFactors = FALSE)
     ed <- as.data.frame(net$edges, stringsAsFactors = FALSE)
@@ -1507,13 +1855,82 @@ observeEvent(input$extract_article_content, {
   }
   register_flca_outputs <- function(id, net, label) {
     real <- reactive(flca_result_cached(id, net()))
+    kano_structural_hole_bubbles <- function(nodes, network) {
+      nodes <- as.data.frame(nodes, stringsAsFactors = FALSE)
+      holes <- structural_hole_metrics(network)
+      # Direct openness percentage: (1 - Burt constraint) x 100; no normalization.
+      nodes$size_plot <- NA_real_
+      if (!("Status" %in% names(holes)) && nrow(holes)) {
+        ix <- match(as.character(nodes$name), as.character(holes$Node))
+        constraint <- suppressWarnings(as.numeric(holes$Burt_Constraint[ix]))
+        nodes$size_plot[is.finite(constraint)] <- 100 * (1 - constraint[is.finite(constraint)])
+      }
+      v <- suppressWarnings(as.numeric(nodes$value))
+      ranked <- order(v, decreasing = TRUE, na.last = NA)
+      if (!length(ranked)) return(list(nodes = nodes, annotation = "AAC and (1 - C)% are unavailable: no finite document counts."))
+      top <- ranked[1]
+      values <- sort(v[is.finite(v) & v > 0], decreasing = TRUE)
+      aac <- NA_real_
+      if (length(values) >= 3 && values[2] > 0 && values[3] > 0) {
+        r <- (values[1] / values[2]) / (values[2] / values[3])
+        aac <- r / (1 + r)
+      }
+      list(nodes = nodes, annotation = sprintf(
+        "Top 1 (document count): %s | (1 - C): %.1f%% | AAC: %s\nBubble size is direct (1 - Burt constraint) x 100, not normalized. AAC = r/(1+r); r = (v1/v2)/(v2/v3); v = document count",
+        as.character(nodes$name[top]), nodes$size_plot[top],
+        if (is.finite(aac)) sprintf("%.2f", aac) else "not estimable"
+      ))
+    }
     output[[paste0(id,"_nodes")]] <- renderTable({ n <- net()$nodes; if (!nrow(n)) return(data.frame(Status = "No terms available.")); names(n) <- c("Node", "Count"); n }, striped = TRUE, bordered = TRUE)
     output[[paste0(id,"_full")]] <- renderPlot(draw_network(net(), paste(label,"full co-occurrence network"), region_style = id == "regions"))
+    output[[paste0(id,"_structural_holes")]] <- renderTable({
+      d <- structural_hole_metrics(net())
+      if ("Status" %in% names(d)) return(d)
+      head(d, 20)
+    }, digits = 3, striped = TRUE, bordered = TRUE)
+    output[[paste0(id,"_structural_holes_3d")]] <- renderPlot(draw_structural_hole_3d(net(), label))
+    output[[paste0(id,"_structural_holes_3d_note")]] <- renderUI({
+      single_author_n <- NA_integer_
+      if (identical(id, "authors")) {
+        x <- data()
+        if ("Authors" %in% names(x)) single_author_n <- sum(vapply(x$Authors, function(a) length(unique_terms(a)) == 1L, logical(1)), na.rm = TRUE)
+      }
+      structural_hole_3d_note(net(), label, single_author_n)
+    })
     output[[paste0(id,"_reduced")]] <- renderPlot(draw_reduced(real(), paste(label,"real FLCA Top-20 reduced network"), region_style = id == "regions"))
     output[[paste0(id,"_sankey")]] <- renderPlot(draw_sankey(real(), paste(label,"FLCA Sankey plot"), region_style = id == "regions"))
     output[[paste0(id,"_chord")]] <- renderPlot(draw_chord(real(), paste(label,"FLCA chord plot"), region_style = id == "regions"))
     output[[paste0(id,"_ss")]] <- renderPlot({ r<-real(); if(is.null(r)||inherits(r,"flca_error")) draw_message("Not enough data for SSPlot.") else { source("renderSSplot.R",local=TRUE); s<-r$modes; s$sil_width<-s$ssi; render_panel(s,make_nodes0(s),results=make_ss_results(r),nodes=s,top_n=min(20,nrow(s)),font_scale=1.15) } })
-    output[[paste0(id,"_kano")]] <- renderPlot({ r<-real(); if(is.null(r)||inherits(r,"flca_error")) draw_message("Not enough data for Kano plot.") else { source("kano.R",local=TRUE); print(plot_kano_real(r$modes,edges=r$data,title_txt=paste(label,"Kano plot"),visual_ratio=1)) } })
+    output[[paste0(id,"_kano")]] <- renderPlot({
+      r <- real()
+      source("kano.R", local = TRUE)
+      if (!is.null(r) && !inherits(r, "flca_error")) {
+        kano <- kano_structural_hole_bubbles(r$modes, net())
+        p <- plot_kano_real(kano$nodes, edges = r$data, title_txt = paste(label, "Kano plot"), visual_ratio = 1) +
+          ggplot2::labs(subtitle = kano$annotation) +
+          ggplot2::theme(plot.subtitle = ggplot2::element_text(hjust = 0.5, face = "bold", size = 10))
+        print(p)
+      } else {
+        # Node frequency alone is sufficient for the table, but not for FLCA.
+        # Retain a diagnostic Kano plot when top nodes have no mutual co-word ties.
+        raw <- net(); nd <- as.data.frame(raw$nodes, stringsAsFactors = FALSE); ed <- as.data.frame(raw$edges, stringsAsFactors = FALSE)
+        if (nrow(nd) < 2) return(draw_message("Kano plot needs at least two nodes."))
+        nd <- data.frame(name = as.character(nd$term), value = as.numeric(nd$frequency), value2 = 0, carac = 1L, stringsAsFactors = FALSE)
+        if (nrow(ed)) {
+          from <- match(as.character(ed$from), nd$name); to <- match(as.character(ed$to), nd$name); w <- as.numeric(ed$weight)
+          valid <- is.finite(from) & is.finite(to) & is.finite(w)
+          if (any(valid)) {
+            strength <- numeric(nrow(nd)); strength <- strength + as.numeric(rowsum(w[valid], from[valid], reorder = FALSE)[as.character(seq_len(nrow(nd))), 1]); strength <- strength + as.numeric(rowsum(w[valid], to[valid], reorder = FALSE)[as.character(seq_len(nrow(nd))), 1]); nd$value2 <- replace(strength, !is.finite(strength), 0)
+          }
+        }
+        subtitle <- if (any(nd$value2 > 0)) "Raw co-word links are shown; FLCA clustering was unavailable." else "No co-word links occur among the displayed nodes; all terms have Coword count = 0."
+        kano <- kano_structural_hole_bubbles(nd, raw)
+        p <- plot_kano_real(kano$nodes, edges = ed, title_txt = paste(label, "Kano plot"), visual_ratio = 1) +
+          ggplot2::labs(subtitle = paste(subtitle, kano$annotation, sep = "\n")) +
+          ggplot2::theme(plot.subtitle = ggplot2::element_text(hjust = 0.5, face = "bold", size = 10))
+        print(p)
+      }
+    })
     output[[paste0(id,"_slope")]] <- renderPlot({ if (id == "cited_references") { p <- cited_reference_slope() } else p <- entity_slope(switch(id, authors=c("FA_Author","CA_Author"), first_authors=c("FA_Author"), corresponding_authors=c("CA_Author"), first_author_countries=c("FA_Country"), first_author_institutes=c("FA_Institute"), first_author_departments=c("FA_Department"), corresponding_author_countries=c("CA_Country"), corresponding_author_institutes=c("CA_Institute"), corresponding_author_departments=c("CA_Department"), keywords=c("Author_Keywords","Keywords"), index_keywords=c("Index_Keywords"), countries=c("FA_Country","CA_Country"), institutes=c("FA_Institute","CA_Institute"), departments=c("FA_Department","CA_Department"), regions=c("FA_Region","CA_Region")), label); if(is.null(p)) draw_message("No dated terms available for slope plot.") else print(p) })
     output[[paste0(id,"_clusters")]] <- renderTable({ r<-real(); if(is.null(r)||inherits(r,"flca_error")) return(data.frame(Status="Not enough co-occurrences for FLCA.")); r$modes }, striped=TRUE,bordered=TRUE)
     output[[paste0(id,"_edges")]] <- renderTable({ r<-real(); if(is.null(r)||inherits(r,"flca_error")) return(NULL); r$data }, striped=TRUE,bordered=TRUE)
